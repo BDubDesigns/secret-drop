@@ -1,300 +1,585 @@
 #!/usr/bin/env python3
+"""shh: a small, anonymous, single-use encrypted handoff relay.
+
+The receiver helper creates the drop and keeps the private key. The browser
+uses libsodium's sealed-box primitive to encrypt directly to the receiver's
+public key. This server stores only opaque ciphertext in RAM.
+
+This milestone deliberately uses one origin for the page and relay. It
+protects against plaintext entering chat/model context, normal tool output, or
+relay storage. It does not protect against a compromised relay serving altered
+JavaScript; the architecture document calls that boundary out explicitly.
 """
-secret-drop -- a Yopass-style single-use secret drop box.
 
-The user pastes a secret in the browser. Web Crypto (AES-GCM) encrypts it
-client-side in the browser; the server only ever sees/stores ciphertext (the
-"server cannot decrypt" property). The decryption key rides in the URL fragment
-(#...) which never reaches the server.
-
-The server is RAM-only, single-use: a secret is deleted after first read (or
-after a TTL). Fetching a secret requires the random one-time ID (the "code").
-
-Agent side: the agent fetches `GET /out/<id>` with curl into a file, then
-decrypts with the key from the URL fragment using a helper script -- so the
-plaintext never enters the agent's context/transcript.
-
-Hardening (production-safe for public/anonymous hosting):
-  - Per-IP POST rate limiting (token bucket) -- prevents abuse floods.
-  - Payload size cap -- a single secret can't exceed MAX_PAYLOAD_BYTES.
-  - Storage ceiling -- total ciphertext bytes are bounded so an abuse spike
-    can't OOM the box.
-  - Short default TTL + a background sweeper for expired secrets.
-  - `Cache-Control: no-store` on every response.
-  - robots.txt ALLOWS crawling -- agents must be able to discover the tool.
-    (Safety comes from single-use + E2E encryption, NOT from blocking bots.)
-
-Run:
-    python3 server.py --port 8899 --ttl 1800
-Serve the dir behind a reverse proxy (Coolify / Let's Encrypt, or a cloudflared
-quick tunnel for testing). Bind 127.0.0.1 by default -- keep it behind the proxy.
-"""
+from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
+import hashlib
+import hmac
+import ipaddress
 import json
+import os
+import re
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
-# ---------------------------------------------------------------------------
-# Tunables (hardening knobs)
-# ---------------------------------------------------------------------------
-DEFAULT_TTL_SECONDS = 1800.0          # 30 min default lifetime
-MAX_PAYLOAD_BYTES = 1_000_000         # 1 MB max per secret (ciphertext+iv)
-MAX_TOTAL_BYTES = 50_000_000          # 50 MB total storage ceiling
-MAX_POSTS_PER_MINUTE = 10             # per-IP POST rate limit
+
+DEFAULT_TTL_SECONDS = 1800.0
+MAX_PAYLOAD_BYTES = 1_000_000
+MAX_TOTAL_BYTES = 50_000_000
+MAX_ACTIVE_DROPS = 1_000
+MAX_POSTS_PER_MINUTE = 10
+MAX_CLAIMS_PER_MINUTE = 120
 SWEEP_INTERVAL_SECONDS = 30.0
-
-# ---------------------------------------------------------------------------
-# Storage: dict of id -> {payload, iv, created, ttl}. RAM only. Never touches disk.
-# ---------------------------------------------------------------------------
-STORE: dict[str, dict] = {}
-STORE_LOCK = threading.Lock()
-TOTAL_BYTES = 0
-
-# Per-IP POST rate limiting: dict of ip -> list[timestamps] (rolling window).
-# Accessed under STORE_LOCK.
-POST_HISTORY: dict[str, list[float]] = {}
+USAGE_LOG_RETENTION_SECONDS = 14 * 24 * 60 * 60
+USAGE_LOG_MAX_BYTES = 5_000_000
+DROP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+STATIC_ROOT = Path(__file__).with_name("static")
+VENDOR_ROOT = Path(__file__).with_name("vendor")
 
 
-def _now() -> float:
-    return time.time()
+@dataclass
+class Drop:
+    created: float
+    ttl: float
+    payload: bytes | None = None
+    status: str = "pending"
 
 
-def _exceeds_post_rate(ip: str) -> bool:
-    """Return True if this IP has posted more than MAX_POSTS_PER_MINUTE recently."""
-    with STORE_LOCK:
-        now = _now()
-        window = now - 60.0
-        recent = [t for t in POST_HISTORY.get(ip, []) if t > window]
-        POST_HISTORY[ip] = recent
-        if len(recent) >= MAX_POSTS_PER_MINUTE:
-            return True
-        recent.append(now)
-        POST_HISTORY[ip] = recent
-        return False
+class DropStore:
+    """Bounded RAM-only store with atomic submit and claim operations."""
 
+    def __init__(
+        self,
+        *,
+        ttl: float = DEFAULT_TTL_SECONDS,
+        max_payload: int = MAX_PAYLOAD_BYTES,
+        max_total: int = MAX_TOTAL_BYTES,
+        max_active: int = MAX_ACTIVE_DROPS,
+    ) -> None:
+        self.ttl = ttl
+        self.max_payload = max_payload
+        self.max_total = max_total
+        self.max_active = max_active
+        self._drops: dict[str, Drop] = {}
+        self._total_bytes = 0
+        self._lock = threading.Lock()
 
-def _store_secret(payload_b64: str, iv_b64: str, ttl: float) -> tuple[str | None, str | None]:
-    """Store a secret. Returns (id, error). error is None on success."""
-    global TOTAL_BYTES
-    size = len(payload_b64) + len(iv_b64)
-    with STORE_LOCK:
-        if TOTAL_BYTES + size > MAX_TOTAL_BYTES:
-            return None, "storage_full"
-        secret_id = secrets.token_urlsafe(18)
-        STORE[secret_id] = {
-            "payload": payload_b64,
-            "iv": iv_b64,
-            "created": _now(),
-            "ttl": ttl,
-        }
-        TOTAL_BYTES += size
-    return secret_id, None
+    def _expired(self, item: Drop, now: float) -> bool:
+        return now - item.created > item.ttl
 
+    def _remove_expired_locked(self, now: float) -> None:
+        for drop_id, item in list(self._drops.items()):
+            if self._expired(item, now):
+                if item.payload is not None:
+                    self._total_bytes -= len(item.payload)
+                del self._drops[drop_id]
+        self._total_bytes = max(0, self._total_bytes)
 
-def _take_secret(secret_id: str) -> dict | None:
-    """Return the secret and DELETE it (single-use). None if missing/expired."""
-    global TOTAL_BYTES
-    with STORE_LOCK:
-        item = STORE.pop(secret_id, None)
-        if item is None:
+    def create(self) -> tuple[str | None, str | None]:
+        with self._lock:
+            self._remove_expired_locked(time.time())
+            if len(self._drops) >= self.max_active:
+                return None, "storage_full"
+            drop_id = secrets.token_urlsafe(24)
+            self._drops[drop_id] = Drop(created=time.time(), ttl=self.ttl)
+            return drop_id, None
+
+    def submit(self, drop_id: str, payload: bytes) -> str | None:
+        if len(payload) > self.max_payload:
+            return "payload_too_large"
+        with self._lock:
+            now = time.time()
+            self._remove_expired_locked(now)
+            item = self._drops.get(drop_id)
+            if item is None:
+                return "not_found"
+            if item.status != "pending":
+                return "already_submitted"
+            if self._total_bytes + len(payload) > self.max_total:
+                return "storage_full"
+            item.payload = payload
+            item.status = "submitted"
+            self._total_bytes += len(payload)
             return None
-        TOTAL_BYTES -= len(item["payload"]) + len(item["iv"])
-        TOTAL_BYTES = max(0, TOTAL_BYTES)
-        if _now() - item["created"] > item["ttl"]:
-            return None  # expired; already removed
-        return item
+
+    def claim(self, drop_id: str) -> tuple[str, bytes | None]:
+        with self._lock:
+            item = self._drops.get(drop_id)
+            if item is None or self._expired(item, time.time()):
+                if item is not None:
+                    if item.payload is not None:
+                        self._total_bytes -= len(item.payload)
+                    del self._drops[drop_id]
+                self._total_bytes = max(0, self._total_bytes)
+                return "not_found", None
+            if item.status == "pending":
+                return "pending", None
+            if item.status == "claimed" or item.payload is None:
+                return "not_found", None
+            payload = item.payload
+            self._total_bytes -= len(payload)
+            item.payload = None
+            item.status = "claimed"
+            self._total_bytes = max(0, self._total_bytes)
+            return "claimed", payload
+
+    def status(self, drop_id: str) -> str | None:
+        with self._lock:
+            item = self._drops.get(drop_id)
+            if item is None or self._expired(item, time.time()):
+                return None
+            return item.status
+
+    def sweep(self) -> None:
+        with self._lock:
+            self._remove_expired_locked(time.time())
 
 
-def _sweep_expired(ttl_floor: float) -> None:
-    global TOTAL_BYTES
-    with STORE_LOCK:
-        now = _now()
-        for sid in [s for s, v in STORE.items() if now - v["created"] > v["ttl"]]:
-            item = STORE.pop(sid, None)
-            if item:
-                TOTAL_BYTES -= len(item["payload"]) + len(item["iv"])
-        TOTAL_BYTES = max(0, TOTAL_BYTES)
+class RateLimiter:
+    def __init__(
+        self,
+        limit: int,
+        window_seconds: float = 60.0,
+        max_clients: int = 10_000,
+    ) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.max_clients = max_clients
+        self._history: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, client_id: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+        with self._lock:
+            if client_id not in self._history and len(self._history) >= self.max_clients:
+                stale = next(
+                    (key for key, stamps in self._history.items() if not stamps or stamps[-1] <= cutoff),
+                    None,
+                )
+                del self._history[stale or next(iter(self._history))]
+            recent = [stamp for stamp in self._history.get(client_id, []) if stamp > cutoff]
+            if len(recent) >= self.limit:
+                self._history[client_id] = recent
+                return False
+            recent.append(now)
+            self._history[client_id] = recent
+            return True
 
 
-# ---------------------------------------------------------------------------
-# The page (embedded HTML with usage instructions for humans AND agents)
-# ---------------------------------------------------------------------------
-def _build_page(ttl_seconds: float) -> str:
-    ttl_min = int(ttl_seconds // 60)
+class UsageLogger:
+    """Short-lived, local, pseudonymous abuse/usage telemetry."""
+
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        key: bytes | None = None,
+        retention_seconds: float = USAGE_LOG_RETENTION_SECONDS,
+    ) -> None:
+        self.path = Path(path)
+        self.key = key or secrets.token_bytes(32)
+        self.retention_seconds = retention_seconds
+        self._lock = threading.Lock()
+
+    def _ip_tag(self, ip: str) -> str:
+        return hmac.new(self.key, ip.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:32]
+
+    def _prune_locked(self, now: dt.datetime) -> None:
+        if not self.path.exists() or self.path.stat().st_size > USAGE_LOG_MAX_BYTES:
+            keep: list[str] = []
+        else:
+            keep = []
+            cutoff = now.timestamp() - self.retention_seconds
+            try:
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        record = json.loads(line)
+                        stamp = dt.datetime.fromisoformat(record["ts"].replace("Z", "+00:00")).timestamp()
+                        if stamp >= cutoff and set(record) == {"ts", "event", "ip_tag", "status"}:
+                            keep.append(json.dumps(record, separators=(",", ":")))
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+            except OSError:
+                keep = []
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_name(f".{self.path.name}.prune-{secrets.token_hex(8)}")
+        try:
+            temp.write_text("" if not keep else "\n".join(keep) + "\n", encoding="utf-8")
+            os.chmod(temp, 0o600)
+            os.replace(temp, self.path)
+            os.chmod(self.path, 0o600)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+    def record(self, event: str, ip: str, status: str) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        record = {
+            "ts": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "event": event,
+            "ip_tag": self._ip_tag(ip),
+            "status": status,
+        }
+        with self._lock:
+            self._prune_locked(now)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                os.chmod(self.path, 0o600)
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
+def _decode_payload(text: Any) -> bytes:
+    if not isinstance(text, str) or not B64URL_RE.fullmatch(text):
+        raise ValueError("bad_payload")
+    if len(text) > ((MAX_PAYLOAD_BYTES + 2) * 4 // 3) + 4:
+        raise ValueError("payload_too_large")
+    try:
+        payload = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except Exception as exc:
+        raise ValueError("bad_payload") from exc
+    if not payload or len(payload) > MAX_PAYLOAD_BYTES:
+        raise ValueError("payload_too_large")
+    if base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii") != text:
+        raise ValueError("bad_payload")
+    return payload
+
+
+def _json_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+
+def _build_page(ttl_seconds: float) -> tuple[str, str]:
+    ttl_min = max(1, int(ttl_seconds // 60))
+    nonce = secrets.token_urlsafe(18)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Secret Drop — single-use secret sharing</title>
-<meta name="description" content="Send a secret to an AI agent without ever pasting it in chat. Browser-side AES-GCM encryption, single-use links, server can't decrypt.">
+<title>shh — private secret handoff</title>
+<meta name="description" content="Deliver one secret to a declared agent-side environment file without putting plaintext in chat.">
 <style>
-  body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:620px;margin:40px auto;padding:0 20px;line-height:1.6}}
-  h1{{font-size:1.5rem}} h2{{font-size:1.1rem;margin-top:28px}}
-  textarea{{width:100%;height:140px;background:#1a1d24;color:#e6e6e6;border:1px solid #333;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;box-sizing:border-box}}
-  button{{margin-top:12px;padding:10px 18px;border:0;border-radius:8px;background:#4f8cff;color:#fff;font-size:1rem;cursor:pointer}}
-  button:disabled{{opacity:.5}}
-  #result{{margin-top:16px;white-space:pre-wrap;word-break:break-all;background:#1a1d24;padding:12px;border-radius:8px;display:none}}
-  .note{{font-size:.85rem;color:#9aa;margin-top:24px;line-height:1.6}}
-  code,pre{{background:#1a1d24;padding:1px 5px;border-radius:4px;font-family:ui-monospace,monospace}}
-  pre{{padding:10px;overflow-x:auto}}
-  .alert{{background:#2a1f1f;border:1px solid #5a3a3a;padding:10px 14px;border-radius:8px;margin-top:20px;font-size:.9rem}}
+body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:640px;margin:40px auto;padding:0 20px;line-height:1.6}}
+h1{{font-size:1.6rem}} h2{{font-size:1.1rem;margin-top:28px}}
+textarea{{width:100%;height:150px;background:#1a1d24;color:#e6e6e6;border:1px solid #333;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;box-sizing:border-box}}
+button{{margin-top:12px;padding:10px 18px;border:0;border-radius:8px;background:#4f8cff;color:#fff;font-size:1rem;cursor:pointer}}
+button:disabled{{opacity:.5}} #status{{margin-top:16px;white-space:pre-wrap;background:#1a1d24;padding:12px;border-radius:8px;display:none}}
+.note{{font-size:.86rem;color:#aeb4c0;margin-top:24px}} .alert{{background:#2a1f1f;border:1px solid #5a3a3a;padding:10px 14px;border-radius:8px;margin-top:20px;font-size:.9rem}}
 </style></head><body>
-<h1>🔐 Secret Drop</h1>
-<p>Paste your secret below. It is <b>encrypted in your browser</b> (AES-GCM) before it leaves your machine. The server stores only ciphertext and deletes it after first read (or {ttl_min} min).</p>
-
-<h2>Create a secret</h2>
-<textarea id="input" placeholder="Paste the secret here..."></textarea><br>
-<button id="go">Encrypt &amp; create link</button>
-<div id="result"></div>
-
-<h2>How to use it</h2>
-<p><b>For a human:</b> paste your secret above, click encrypt, copy the link, and send the <i>whole link</i> to your agent. The part after <code>#</code> is the decryption key — it never touches the server. The link works once and then self-destructs.</p>
-<p><b>For an AI agent (the part after the <code>#</code> is the key):</b></p>
-<pre>curl -s "https://BASE_URL/out/&#123;ID&#125;" \
-  | jq -r .payload > /tmp/ct.b64
-# then decrypt /tmp/ct.b64 with the key from the URL fragment
-python3 decrypt_to_file.py "https://BASE_URL/&#123;ID&#125;.&#123;KEY&#125;" ~/.secrets/secret</pre>
-<p>The agent fetches the ciphertext, decrypts with the key, and writes the plaintext to a file — the secret value <b>never enters the chat transcript</b>.</p>
-
-<div class="alert"><b>Security note:</b> this is a public, anonymous tool. Links are single-use and self-destruct after first read. The server cannot decrypt your secret — it only ever holds ciphertext, and the key never leaves the recipient's browser. Never use this for anything you wouldn't trust to a public URL.</div>
-
-<script>
-const enc = new TextEncoder();
-async function encrypt(plain) {{
-  const key = await crypto.subtle.generateKey({{name:"AES-GCM",length:256}}, true, ["encrypt","decrypt"]);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({{name:"AES-GCM",iv}}, key, enc.encode(plain));
-  const raw = await crypto.subtle.exportKey("raw", key);
-  const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
-  return {{ct: b64(ct), iv: b64(iv), key: b64(raw)}};
-}}
-document.getElementById("go").onclick = async () => {{
-  const plain = document.getElementById("input").value;
-  if(!plain){{alert("Paste a secret first.");return;}}
-  const btn = document.getElementById("go"); btn.disabled = true;
-  try {{
-    const {{ct, iv, key}} = await encrypt(plain);
-    const r = await fetch("/secret", {{method:"POST", headers:{{"Content-Type":"application/json"}},
-      body: JSON.stringify({{payload: ct, iv}})}});
-    const j = await r.json();
-    const link = location.href.split("#")[0] + "#" + j.id + "." + key;
-    const out = document.getElementById("result");
-    out.style.display = "block";
-    out.textContent = link;
-    out.onclick = () => {{ navigator.clipboard.writeText(link); }};
-  }} finally {{ btn.disabled = false; }}
-}};
-</script></body></html>"""
+<h1>🔐 shh</h1>
+<p>Paste one secret for the receiver who sent you this link. Your browser encrypts it with the receiver's one-time public key before upload. The relay stores only ciphertext and the drop expires after {ttl_min} minutes.</p>
+<h2>Secret</h2>
+<textarea id="input" autocomplete="off" spellcheck="false" placeholder="Paste the secret here..."></textarea><br>
+<button id="send" type="button">Encrypt &amp; deliver</button>
+<div id="status" role="status"></div>
+<p class="note">For abuse monitoring, this service records a short-lived pseudonymous client identifier, timestamp, event, and status. It does not record secret contents, links, target paths, or request bodies. Logs are retained locally for 14 days.</p>
+<div class="alert"><b>Trust boundary:</b> this personal-use service keeps the secret out of chat, model context, normal tool output, and relay storage. It assumes this origin serves the expected browser code; a compromised relay could alter new submissions.</div>
+<script type="importmap" nonce="{nonce}">{{"imports":{{"libsodium":"/static/libsodium.mjs"}}}}</script>
+<script type="module" nonce="{nonce}" src="/static/app.js"></script>
+</body></html>""", nonce
 
 
-# ---------------------------------------------------------------------------
-# HTTP handler
-# ---------------------------------------------------------------------------
 class DropHandler(BaseHTTPRequestHandler):
-    secret_ttl: float = DEFAULT_TTL_SECONDS
+    store: DropStore
+    create_limiter: RateLimiter
+    submit_limiter: RateLimiter
+    claim_limiter: RateLimiter
+    usage: UsageLogger
+    secret_ttl: float
+    trust_proxy: bool
+    trusted_proxy_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
 
-    def log_message(self, fmt, *args):
-        pass  # keep console noise low
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # Deliberately suppress default request logging: URLs can contain drop IDs.
+        return
 
     def _client_ip(self) -> str:
-        # Respect X-Forwarded-For when behind a proxy (Coolify/tunnel).
-        xff = self.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0]
+        peer_ip = self.client_address[0]
+        if self.trust_proxy:
+            try:
+                peer = ipaddress.ip_address(peer_ip)
+            except ValueError:
+                peer = None
+            trusted_peer = peer is not None and any(
+                peer in network for network in self.trusted_proxy_networks
+            )
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            if trusted_peer and forwarded:
+                candidate = forwarded.split(",", 1)[0].strip()
+                try:
+                    ipaddress.ip_address(candidate)
+                    return candidate
+                except ValueError:
+                    pass
+        return peer_ip
 
-    def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
+    def _send(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str = "application/json",
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj: dict, code: int = 200) -> None:
-        self._send(code, json.dumps(obj).encode())
+    def _json(self, value: dict[str, Any], code: int = 200) -> None:
+        self._send(code, _json_bytes(value))
 
-    def do_GET(self):
+    def _read_json(self, limit: int) -> dict[str, Any] | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if length < 0 or length > limit:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length))
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _drop_id(self, path: str, suffix: str) -> str | None:
+        prefix = "/api/drops/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        drop_id = path[len(prefix) : -len(suffix)]
+        return drop_id if DROP_ID_RE.fullmatch(drop_id) else None
+
+    def _rate_limited(self, limiter: RateLimiter, ip: str, event: str) -> bool:
+        if limiter.allow(ip):
+            return False
+        self.usage.record(event, ip, "rate_limited")
+        self._json({"error": "rate_limited"}, 429)
+        return True
+
+    def do_GET(self) -> None:
         path = urlparse(self.path).path
-        if path == "/" or path == "/index.html":
-            self._send(200, _build_page(self.secret_ttl).encode(), "text/html; charset=utf-8")
+        ip = self._client_ip()
+        if path in {"/", "/index.html"}:
+            self.usage.record("page", ip, "ok")
+            page, nonce = _build_page(self.secret_ttl)
+            body = page.encode("utf-8")
+            csp = (
+                "default-src 'none'; script-src 'self' 'nonce-"
+                + nonce
+                + "' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'none'"
+            )
+            self._send(
+                200,
+                body,
+                "text/html; charset=utf-8",
+                {"Content-Security-Policy": csp},
+            )
             return
         if path == "/robots.txt":
-            # Allow crawling -- agents must be able to discover the tool.
-            self._send(200, b"User-agent: *\nAllow: /\n", "text/plain")
+            self._send(200, b"User-agent: *\nAllow: /\n", "text/plain; charset=utf-8")
             return
         if path == "/healthz":
             self._json({"status": "ok"})
             return
-        if path.startswith("/out/"):
-            secret_id = path[len("/out/"):]
-            item = _take_secret(secret_id)
-            if item is None:
+        if path.startswith("/static/"):
+            filename = path.removeprefix("/static/")
+            allowed = {"app.js": STATIC_ROOT / "app.js", "libsodium.mjs": VENDOR_ROOT / "libsodium.mjs", "libsodium-wrappers.mjs": VENDOR_ROOT / "libsodium-wrappers.mjs"}
+            file_path = allowed.get(filename)
+            if file_path is None or not file_path.is_file():
                 self._json({"error": "not_found"}, 404)
                 return
-            self._json({"payload": item["payload"], "iv": item["iv"]})
+            content_type = "application/javascript; charset=utf-8"
+            self._send(200, file_path.read_bytes(), content_type)
+            return
+        if path.startswith("/out/") or path == "/secret":
+            self._json({"error": "legacy_endpoint_removed"}, 410)
+            return
+        if path.startswith("/api/drops/"):
+            drop_id = path.removeprefix("/api/drops/")
+            if not DROP_ID_RE.fullmatch(drop_id):
+                self._json({"error": "not_found"}, 404)
+                return
+            status = self.store.status(drop_id)
+            if status is None:
+                self._json({"error": "not_found"}, 404)
+            else:
+                self._json({"status": status})
             return
         self._json({"error": "not_found"}, 404)
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path != "/secret":
-            self._json({"error": "not_found"}, 404)
-            return
-
         ip = self._client_ip()
-        if _exceeds_post_rate(ip):
-            self._json({"error": "rate_limited"}, 429)
+        if path == "/api/drops":
+            if self._rate_limited(self.create_limiter, ip, "drop_created"):
+                return
+            if self._read_json(4096) is None:
+                self.usage.record("drop_created", ip, "bad_request")
+                self._json({"error": "bad_request"}, 400)
+                return
+            drop_id, error = self.store.create()
+            if error:
+                self.usage.record("drop_created", ip, error)
+                self._json({"error": error}, 503)
+                return
+            self.usage.record("drop_created", ip, "ok")
+            self._json({"id": drop_id, "ttl": self.secret_ttl}, 201)
             return
 
-        length = int(self.headers.get("Content-Length", 0))
-        if length <= 0 or length > MAX_PAYLOAD_BYTES:
-            self._json({"error": "payload_too_large"}, 413)
+        payload_drop = self._drop_id(path, "/payload")
+        if payload_drop is not None:
+            if self._rate_limited(self.submit_limiter, ip, "payload_submitted"):
+                return
+            data = self._read_json(MAX_PAYLOAD_BYTES * 2)
+            if data is None or data.get("v") != 1:
+                self.usage.record("payload_submitted", ip, "bad_payload")
+                self._json({"error": "bad_payload"}, 400)
+                return
+            try:
+                payload = _decode_payload(data.get("payload"))
+            except ValueError as exc:
+                error = str(exc)
+                self.usage.record("payload_submitted", ip, error)
+                self._json({"error": error}, 413 if error == "payload_too_large" else 400)
+                return
+            error = self.store.submit(payload_drop, payload)
+            if error:
+                self.usage.record("payload_submitted", ip, error)
+                self._json({"error": error}, 404 if error == "not_found" else 409 if error == "already_submitted" else 503)
+                return
+            self.usage.record("payload_submitted", ip, "ok")
+            self._send(204, b"")
             return
-        try:
-            data = json.loads(self.rfile.read(length))
-        except Exception:
-            self._json({"error": "bad_request"}, 400)
+
+        claim_drop = self._drop_id(path, "/claim")
+        if claim_drop is not None:
+            if self._rate_limited(self.claim_limiter, ip, "claim"):
+                return
+            if self._read_json(4096) is None:
+                self.usage.record("claim", ip, "bad_request")
+                self._json({"error": "bad_request"}, 400)
+                return
+            status, payload = self.store.claim(claim_drop)
+            if status == "pending":
+                self.usage.record("claim", ip, "pending")
+                self._json({"status": "pending"}, 202)
+                return
+            if status == "not_found" or payload is None:
+                self.usage.record("claim", ip, "not_found")
+                self._json({"error": "not_found"}, 404)
+                return
+            self.usage.record("claim_succeeded", ip, "ok")
+            encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+            self._json({"v": 1, "payload": encoded})
             return
-        payload = data.get("payload")
-        iv = data.get("iv")
-        if not payload or not iv or len(payload) + len(iv) > MAX_PAYLOAD_BYTES:
-            self._json({"error": "missing_payload"}, 400)
+
+        if path == "/secret":
+            self._json({"error": "legacy_endpoint_removed"}, 410)
             return
-        sid, err = _store_secret(payload, iv, self.secret_ttl)
-        if err == "storage_full":
-            self._json({"error": "storage_full"}, 503)
-            return
-        self._json({"id": sid, "ttl": self.secret_ttl})
+        self._json({"error": "not_found"}, 404)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8899)
-    ap.add_argument("--ttl", type=float, default=DEFAULT_TTL_SECONDS,
-                    help="seconds a secret lives before auto-delete")
-    ap.add_argument("--host", default="127.0.0.1",
-                    help="bind address (keep behind a proxy; default 127.0.0.1)")
-    args = ap.parse_args()
+def make_server(
+    host: str = "127.0.0.1",
+    port: int = 8899,
+    *,
+    ttl: float = DEFAULT_TTL_SECONDS,
+    usage_log_path: Path | str = "usage.jsonl",
+    usage_key: bytes | None = None,
+    trust_proxy: bool = False,
+    trusted_proxy_cidrs: tuple[str, ...] = (),
+    posts_per_minute: int = MAX_POSTS_PER_MINUTE,
+    claims_per_minute: int = MAX_CLAIMS_PER_MINUTE,
+) -> ThreadingHTTPServer:
+    store = DropStore(ttl=ttl)
+    usage = UsageLogger(usage_log_path, key=usage_key)
+    if trust_proxy and not trusted_proxy_cidrs:
+        raise ValueError("trust_proxy requires at least one trusted proxy CIDR")
+    trusted_networks = tuple(ipaddress.ip_network(cidr) for cidr in trusted_proxy_cidrs)
+    handler = type(
+        "BoundDropHandler",
+        (DropHandler,),
+        {
+            "store": store,
+            "create_limiter": RateLimiter(posts_per_minute),
+            "submit_limiter": RateLimiter(posts_per_minute),
+            "claim_limiter": RateLimiter(claims_per_minute),
+            "usage": usage,
+            "secret_ttl": ttl,
+            "trust_proxy": trust_proxy,
+            "trusted_proxy_networks": trusted_networks,
+        },
+    )
+    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd.shh_store = store  # type: ignore[attr-defined]
+    return httpd
 
-    handler = type("DropHandlerBound", (DropHandler,), {"secret_ttl": args.ttl})
-    httpd = ThreadingHTTPServer((args.host, args.port), handler)
 
-    def _sweeper():
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8899)
+    parser.add_argument("--ttl", type=float, default=DEFAULT_TTL_SECONDS)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--usage-log", default="usage.jsonl")
+    parser.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="use the first X-Forwarded-For value; only enable behind a trusted proxy",
+    )
+    parser.add_argument(
+        "--trusted-proxy-cidr",
+        action="append",
+        default=None,
+        help="CIDR for an immediate trusted proxy peer (may be repeated)",
+    )
+    args = parser.parse_args()
+    if args.ttl <= 0:
+        parser.error("--ttl must be positive")
+    trusted_proxy_cidrs = tuple(args.trusted_proxy_cidr or ())
+    if args.trust_proxy and not trusted_proxy_cidrs:
+        parser.error("--trust-proxy requires at least one --trusted-proxy-cidr")
+    httpd = make_server(
+        args.host,
+        args.port,
+        ttl=args.ttl,
+        usage_log_path=args.usage_log,
+        trust_proxy=args.trust_proxy,
+        trusted_proxy_cidrs=trusted_proxy_cidrs,
+    )
+
+    def sweep() -> None:
         while True:
             time.sleep(SWEEP_INTERVAL_SECONDS)
-            _sweep_expired(args.ttl)
-    threading.Thread(target=_sweeper, daemon=True).start()
+            httpd.shh_store.sweep()  # type: ignore[attr-defined]
 
-    print(f"Secret Drop listening on {args.host}:{args.port} (ttl={args.ttl}s)", flush=True)
+    threading.Thread(target=sweep, daemon=True).start()
+    print(f"shh listening on {args.host}:{args.port} (ttl={args.ttl:g}s)", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        httpd.server_close()
 
 
 if __name__ == "__main__":
