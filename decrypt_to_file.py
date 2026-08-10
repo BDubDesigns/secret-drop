@@ -259,6 +259,9 @@ def release(
     try:
         relay = relay.rstrip("/")
         status, created = _json_request(_relay_url(relay, "/api/drops"), "POST", {})
+        if status == 0:
+            print("error: relay unreachable", file=sys.stderr)
+            return 3
         if status != 201 or not isinstance(created, dict):
             print("error: relay could not create a drop", file=sys.stderr)
             return 3
@@ -275,13 +278,24 @@ def release(
             "POST",
             {"v": 1, "payload": payload},
         )
-        if status != 204:
-            print("error: relay rejected the secret payload", file=sys.stderr)
-            return 3
-
-        link = f"{relay}/reveal#{drop_id}.{_b64url(bytes(key))}"
-        print(f"shh reveal link: {link}", flush=True)
-        return 0
+        if status == 204:
+            link = f"{relay}/reveal#{drop_id}.{_b64url(bytes(key))}"
+            print(f"shh reveal link: {link}", flush=True)
+            return 0
+        if status == 0:
+            # Network error: the payload may or may not have landed. The drop
+            # may be live with our key as its only decryptor, so keep the
+            # recovery link instead of discarding it.
+            link = f"{relay}/reveal#{drop_id}.{_b64url(bytes(key))}"
+            print(
+                "warning: could not confirm upload; the secret may be live. "
+                "If the relay accepted it, this link will work once:",
+                file=sys.stderr,
+            )
+            print(f"shh reveal link: {link}", flush=True)
+            return 4
+        print("error: relay rejected the secret payload", file=sys.stderr)
+        return 3
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -301,17 +315,11 @@ def main() -> int:
     receiver.add_argument("--poll-interval", type=float, default=2.0)
     releaser = subparsers.add_parser("release", help="publish one secret for a one-time browser reveal")
     releaser.add_argument("--relay", required=True, help="shh relay origin")
-    releaser.add_argument(
-        "--secret",
-        help="secret to publish (omit to read from stdin; piping avoids argv/process-list exposure)",
-    )
     args = parser.parse_args()
     if args.command == "receive":
         return receive(args.relay, args.name, args.target, args.poll_interval)
     if args.command == "release":
-        secret = args.secret
-        if secret is None:
-            secret = sys.stdin.read()
+        secret = sys.stdin.read()
         return release(args.relay, secret)
     return 2
 

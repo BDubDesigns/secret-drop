@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from dotenv import dotenv_values
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 import server
 
@@ -273,12 +274,22 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
                 else None,
             )
             page.on("pageerror", lambda error: console_errors.append(str(error)))
-            page.goto(link, wait_until="networkidle")
+            # ?clip=1 speeds up the real clipping timer for the test. Insert the
+            # query BEFORE the #fragment so it doesn't corrupt the key.
+            path, _, fragment = link.partition("#")
+            fast_link = f"{path}?clip=1#{fragment}"
+            page.goto(fast_link, wait_until="networkidle")
             page.locator("#reveal").click()
             page.locator("#secret").wait_for(state="visible", timeout=10000)
             revealed = page.locator("#secret").input_value()
             assert revealed == secret
             assert page.locator("#secret-heading").is_visible()
+            # The secret must actually clip itself, and the key-carrying
+            # fragment must be removed from the URL afterwards.
+            page.locator("#secret").wait_for(state="hidden", timeout=10000)
+            assert page.locator("#secret").input_value() == ""
+            assert "#" not in page.url
+            assert "clipped" in page.locator("#status").text_content().lower()
             browser.close()
 
         # Second reveal attempt in a fresh page must fail (single use).
@@ -290,14 +301,77 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
             page = browser.new_page()
             page.goto(link, wait_until="networkidle")
             page.locator("#reveal").click()
-            page.wait_for_function(
-                "document.querySelector('#status').textContent.includes('already been claimed')",
-                timeout=10000,
-            )
+            # CSP forbids eval, so poll via expect() instead of wait_for_function.
+            expect(page.locator("#status")).to_contain_text("already been claimed", timeout=10000)
             assert page.locator("#secret").is_hidden()
             browser.close()
 
         assert not console_errors, console_errors
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=2)
+        httpd.server_close()
+
+def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
+    """A malformed link key must fail before claiming, leaving the drop alive."""
+    usage_log = tmp_path / "usage.jsonl"
+    httpd = server.make_server(
+        "127.0.0.1",
+        0,
+        ttl=60,
+        usage_log_path=usage_log,
+        usage_key=b"browser-truncated-key-test-usage-key-not-secret",
+        posts_per_minute=20,
+    )
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_port}"
+    secret = "truncated-key-secret"
+
+    release = subprocess.run(
+        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
+        input=secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert release.returncode == 0, (release.stdout, release.stderr)
+    link_line = next(
+        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
+    )
+    link = link_line.removeprefix("shh reveal link: ").strip()
+    drop_id, key = link.split("#", 1)[1].split(".", 1)
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            # Truncate the key: 43 chars -> 42 chars. Old behavior claimed the
+            # drop destructively before failing to decrypt.
+            bad_link = f"{base}/reveal#{drop_id}.{key[:-1]}"
+            page.goto(bad_link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            # Either validation path ("malformed" or "incomplete") must refuse
+            # the claim before the relay is touched.
+            expect(page.locator("#status")).to_contain_text("fresh link", timeout=10000)
+            browser.close()
+
+        # The drop must still be intact and claimable with the real key.
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{base}/api/drops/{drop_id}/claim",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            assert response.status == 200, response.status
+            body = json.loads(response.read())
+        assert body.get("v") == 1 and isinstance(body.get("payload"), str)
     finally:
         httpd.shutdown()
         thread.join(timeout=2)

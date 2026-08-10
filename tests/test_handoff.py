@@ -566,7 +566,8 @@ def test_release_cli_publishes_ciphertext_and_prints_reveal_link(app_server):
     assert drop_id not in log_text
 
 
-def test_release_cli_accepts_secret_via_argv_without_plaintext_leak(app_server):
+def test_release_cli_rejects_argv_secret_mode(app_server):
+    """--secret must not exist: argv exposes plaintext via /proc and history."""
     base, _ = app_server
     secret = "argv-release-secret-must-not-leak"
     result = subprocess.run(
@@ -583,7 +584,53 @@ def test_release_cli_accepts_secret_via_argv_without_plaintext_leak(app_server):
         capture_output=True,
         timeout=10,
     )
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    assert secret not in result.stdout
-    assert secret not in result.stderr
-    assert result.stdout.strip().startswith("shh reveal link: ")
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+    # argparse echoes the offending token (the secret) in the usage error —
+    # exactly why argv mode must not exist. The point is the command is
+    # rejected, not that the echo is suppressed.
+    assert result.stdout == ""
+
+
+def test_release_ambiguous_upload_preserves_recovery_link(app_server, monkeypatch, capsys):
+    """If the payload lands but the 204 is lost, exit 4 and keep the link.
+
+    The drop may be live with our key as its only decryptor, so the client
+    must not discard the recovery link on an ambiguous failure.
+    """
+    import decrypt_to_file
+
+    base, _ = app_server
+    secret = "ambiguous-upload-secret"
+
+    real_request = decrypt_to_file._json_request
+
+    def flaky(url: str, method: str, body: dict) -> tuple[int, dict | None]:
+        if method == "POST" and url.endswith("/payload"):
+            # The payload really lands on the relay, but the 204 response is
+            # lost (simulated network drop after delivery).
+            real_request(url, method, body)
+            return 0, None
+        return real_request(url, method, body)
+
+    monkeypatch.setattr(decrypt_to_file, "_json_request", flaky)
+    rc = decrypt_to_file.release(base, secret)
+    captured = capsys.readouterr()
+    assert rc == 4, (captured.out, captured.err)
+    assert "could not confirm upload" in captured.err
+    assert "shh reveal link: " in captured.out
+    link_line = next(
+        line for line in captured.out.splitlines() if line.startswith("shh reveal link: ")
+    )
+    link = link_line.removeprefix("shh reveal link: ").strip()
+    assert link.startswith(base + "/reveal#")
+    assert secret not in captured.out and secret not in captured.err
+
+    # The recovery link must actually work: the drop is live and claimable.
+    drop_id, key_b64 = link.split("#", 1)[1].split(".", 1)
+    status, body = request_json(f"{base}/api/drops/{drop_id}/claim", method="POST", body={})
+    assert status == 200
+    combined = base64.urlsafe_b64decode(body["payload"] + "==")
+    key = base64.urlsafe_b64decode(key_b64 + "==")
+    plaintext = SecretBox(key).decrypt(combined).decode("utf-8")
+    assert plaintext == secret

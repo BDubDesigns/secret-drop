@@ -67,10 +67,17 @@ values, and `${...}` interpolation syntax are rejected rather than transformed.
 ### Reverse handoff: agent → human (`release`)
 
 To hand a secret **back out** to a human without putting plaintext in chat,
-publish it for a one-time browser reveal:
+publish it for a one-time browser reveal. Read the value from stdin — never
+embed the literal in the command line (argv leaks via `/proc/*/cmdline`, shell
+history, and process supervisors):
 
 ```bash
-printf '%s' 'the-secret-value' | .venv/bin/python decrypt_to_file.py release \
+# From a file the agent already holds:
+cat /path/to/secret | .venv/bin/python decrypt_to_file.py release \
+  --relay https://shh.qcfailed.com
+
+# Or from an environment variable (no literal in argv):
+printf '%s' "$SECRET_VAR" | .venv/bin/python decrypt_to_file.py release \
   --relay https://shh.qcfailed.com
 ```
 
