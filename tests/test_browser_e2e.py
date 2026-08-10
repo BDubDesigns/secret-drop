@@ -5,6 +5,7 @@ import sys
 import threading
 from pathlib import Path
 
+from dotenv import dotenv_values
 from playwright.sync_api import sync_playwright
 
 import server
@@ -81,9 +82,15 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
 
         stdout, stderr = receiver.communicate(timeout=10)
         assert receiver.returncode == 0, (stdout, stderr)
-        assert target.read_text() == f'BROWSER_TEST_TOKEN="{secret}"\n'
-        assert secret not in stdout
-        assert secret not in stderr
+        loaded = dotenv_values(target, interpolate=True).get("BROWSER_TEST_TOKEN")
+        if loaded != secret:
+            raise AssertionError("browser handoff value did not round-trip through python-dotenv")
+        if secret in stdout:
+            raise AssertionError("receiver stdout contained the test plaintext")
+        if secret in stderr:
+            raise AssertionError("receiver stderr contained the test plaintext")
+        if secret in usage_log.read_text():
+            raise AssertionError("service telemetry contained the test plaintext")
         assert not console_errors, console_errors
     finally:
         if receiver.poll() is None:

@@ -196,7 +196,9 @@ class UsageLogger:
         return hmac.new(self.key, ip.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:32]
 
     def _prune_locked(self, now: dt.datetime) -> None:
-        if not self.path.exists() or self.path.stat().st_size > USAGE_LOG_MAX_BYTES:
+        if not self.path.exists():
+            return
+        if self.path.stat().st_size > USAGE_LOG_MAX_BYTES:
             keep: list[str] = []
         else:
             keep = []
@@ -215,8 +217,9 @@ class UsageLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(f".{self.path.name}.prune-{secrets.token_hex(8)}")
         try:
-            temp.write_text("" if not keep else "\n".join(keep) + "\n", encoding="utf-8")
-            os.chmod(temp, 0o600)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("" if not keep else "\n".join(keep) + "\n")
             os.replace(temp, self.path)
             os.chmod(self.path, 0o600)
         finally:
@@ -224,6 +227,12 @@ class UsageLogger:
                 temp.unlink()
             except FileNotFoundError:
                 pass
+
+    def maintain(self, now: dt.datetime | None = None) -> None:
+        """Bound log retention outside the request event path."""
+        now = now or dt.datetime.now(dt.timezone.utc)
+        with self._lock:
+            self._prune_locked(now)
 
     def record(self, event: str, ip: str, status: str) -> None:
         now = dt.datetime.now(dt.timezone.utc)
@@ -234,13 +243,16 @@ class UsageLogger:
             "status": status,
         }
         with self._lock:
-            self._prune_locked(now)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                os.chmod(self.path, 0o600)
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            finally:
+                if fd >= 0:
+                    os.close(fd)
 
 
 def _decode_payload(text: Any) -> bytes:
@@ -361,6 +373,9 @@ class DropHandler(BaseHTTPRequestHandler):
             return None
         return data if isinstance(data, dict) else None
 
+    def _has_json_content_type(self) -> bool:
+        return self.headers.get_content_type().lower() == "application/json"
+
     def _drop_id(self, path: str, suffix: str) -> str | None:
         prefix = "/api/drops/"
         if not path.startswith(prefix) or not path.endswith(suffix):
@@ -379,7 +394,6 @@ class DropHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         ip = self._client_ip()
         if path in {"/", "/index.html"}:
-            self.usage.record("page", ip, "ok")
             page, nonce = _build_page(self.secret_ttl)
             body = page.encode("utf-8")
             csp = (
@@ -431,6 +445,9 @@ class DropHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         ip = self._client_ip()
         if path == "/api/drops":
+            if not self._has_json_content_type():
+                self._json({"error": "unsupported_media_type"}, 415)
+                return
             if self._rate_limited(self.create_limiter, ip, "drop_created"):
                 return
             if self._read_json(4096) is None:
@@ -448,6 +465,9 @@ class DropHandler(BaseHTTPRequestHandler):
 
         payload_drop = self._drop_id(path, "/payload")
         if payload_drop is not None:
+            if not self._has_json_content_type():
+                self._json({"error": "unsupported_media_type"}, 415)
+                return
             if self._rate_limited(self.submit_limiter, ip, "payload_submitted"):
                 return
             data = self._read_json(MAX_PAYLOAD_BYTES * 2)
@@ -473,6 +493,9 @@ class DropHandler(BaseHTTPRequestHandler):
 
         claim_drop = self._drop_id(path, "/claim")
         if claim_drop is not None:
+            if not self._has_json_content_type():
+                self._json({"error": "unsupported_media_type"}, 415)
+                return
             if self._rate_limited(self.claim_limiter, ip, "claim"):
                 return
             if self._read_json(4096) is None:
@@ -481,7 +504,6 @@ class DropHandler(BaseHTTPRequestHandler):
                 return
             status, payload = self.store.claim(claim_drop)
             if status == "pending":
-                self.usage.record("claim", ip, "pending")
                 self._json({"status": "pending"}, 202)
                 return
             if status == "not_found" or payload is None:
@@ -513,6 +535,7 @@ def make_server(
 ) -> ThreadingHTTPServer:
     store = DropStore(ttl=ttl)
     usage = UsageLogger(usage_log_path, key=usage_key)
+    usage.maintain()
     if trust_proxy and not trusted_proxy_cidrs:
         raise ValueError("trust_proxy requires at least one trusted proxy CIDR")
     trusted_networks = tuple(ipaddress.ip_network(cidr) for cidr in trusted_proxy_cidrs)
@@ -532,6 +555,7 @@ def make_server(
     )
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.shh_store = store  # type: ignore[attr-defined]
+    httpd.shh_usage = usage  # type: ignore[attr-defined]
     return httpd
 
 
@@ -571,6 +595,7 @@ def main() -> None:
         while True:
             time.sleep(SWEEP_INTERVAL_SECONDS)
             httpd.shh_store.sweep()  # type: ignore[attr-defined]
+            httpd.shh_usage.maintain()  # type: ignore[attr-defined]
 
     threading.Thread(target=sweep, daemon=True).start()
     print(f"shh listening on {args.host}:{args.port} (ttl={args.ttl:g}s)", flush=True)

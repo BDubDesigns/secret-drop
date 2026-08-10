@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest>=8.0,<9
 playwright>=1.50,<2
+python-dotenv==1.2.2

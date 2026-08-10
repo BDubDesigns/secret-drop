@@ -144,24 +144,31 @@ non-UTF-8 files, duplicate assignments, NULs, and multiline values are
 rejected. Unrelated `.env` lines and comments are preserved. The target file is
 always written with mode `0600`.
 
-The writer replaces one assignment with a conservative quoted value. It writes
-to a same-directory temporary file, flushes and fsyncs it, atomically renames
-it, then fsyncs the directory. A crash yields either the old complete file or
-the new complete file, not a partially written file.
+The writer uses a single-quoted representation compatible with normal
+`python-dotenv`/Hermes loading. Accepted values therefore load exactly as
+supplied, including ordinary `$`, backticks, backslashes, and quotes. NULs,
+multiline values, and `${...}` interpolation syntax are rejected instead of
+being silently transformed. It writes to a same-directory temporary file,
+flushes and fsyncs it, atomically renames it, then fsyncs the directory. A crash
+yields either the old complete file or the new complete file, not a partially
+written file.
 
 ## Usage telemetry and privacy
 
-The service records a local JSONL event for page visits, drop creation,
-payload submission, claim outcomes, and rate limiting. Each event contains only:
+The service records a local JSONL event for drop creation and submission
+outcomes, successful or terminal failed claims, and rate limiting. Page visits
+and routine pending claim polls are not persisted. Each event contains only:
 
 ```json
-{"ts":"2026-01-01T12:00:00Z","event":"page","ip_tag":"…","status":"ok"}
+{"ts":"2026-01-01T12:00:00Z","event":"drop_created","ip_tag":"…","status":"ok"}
 ```
 
 `ip_tag` is the first 16 bytes of HMAC-SHA256 over the client IP with a random
 process-local key. The key is regenerated on restart, so the pseudonym is not a
 stable cross-restart identifier. The raw IP is not written to the usage log.
-Logs are local, mode `0600`, and pruned after 14 days. The page discloses this
+Logs are local and mode `0600`. Normal event recording is append-only without a
+per-event log rewrite or fsync; bounded 14-day retention maintenance runs at
+startup and from the existing periodic drop sweeper. The page discloses this
 telemetry.
 
 When deployed behind a reverse proxy, forwarded client IPs are accepted only
@@ -211,7 +218,10 @@ protocol as invalid. Never mix old and new payload formats in one endpoint.
 
 ## Dependencies and provenance
 
-- Python runtime: `PyNaCl==1.6.0`.
+- Python runtime: `PyNaCl==1.6.2`.
+- Development verification: `python-dotenv==1.2.2` loads written `.env` files
+  under the same normal interpolation semantics Hermes relies on; it is not a
+  `shh` runtime dependency.
 - Browser runtime: `libsodium==0.8.4` and `libsodium-wrappers==0.8.4`, vendored
   under `vendor/` and served from the same origin.
 - The exact third-party license texts are in `vendor/` and summarized in

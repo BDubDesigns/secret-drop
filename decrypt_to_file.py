@@ -53,15 +53,8 @@ def _validate_target(target: Path) -> None:
 
 
 def _quote_env_value(value: str) -> str:
-    """Return a conservative double-quoted POSIX-style .env value."""
-    return (
-        '"'
-        + value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("$", "\\$")
-        .replace("`", "\\`")
-        + '"'
-    )
+    """Render a python-dotenv-compatible single-quoted value."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
 def _updated_env_text(existing: str, name: str, value: str) -> str:
@@ -104,6 +97,8 @@ def write_env_value(target: Path | str, name: str, value: str) -> None:
     _validate_target(target_path)
     if not isinstance(value, str) or "\x00" in value or "\r" in value or "\n" in value:
         raise ValueError("secret must be one line of UTF-8 text")
+    if "${" in value:
+        raise ValueError("secret contains unsupported dotenv interpolation syntax")
     if len(value.encode("utf-8")) > _MAX_VALUE_BYTES:
         raise ValueError("secret is too large")
 

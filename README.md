@@ -60,6 +60,9 @@ ok: delivered GITHUB_TOKEN to the approved target.
 ```
 
 The value is written atomically with target mode `0600`. It is never printed by the helper.
+Values accepted by `shh` load exactly under normal python-dotenv/Hermes semantics:
+ordinary `$`, backticks, backslashes, and quotes round-trip. NULs, multiline
+values, and `${...}` interpolation syntax are rejected rather than transformed.
 
 ## Deployment
 
@@ -70,7 +73,7 @@ for a reverse proxy:
 docker build -t shh .
 docker run --rm -p 8899:8899 -v shh-data:/app/data shh \
   python3 server.py --host 0.0.0.0 --port 8899 \
-  --usage-log /app/data/usage.jsonl --trust-proxy
+  --usage-log /app/data/usage.jsonl
 ```
 
 For Coolify, put the service behind HTTPS and keep the usage log on a private
@@ -99,7 +102,10 @@ The server records a local JSONL event with:
 
 It does not record raw IPs, secrets, links/fragments, drop IDs, variable names,
 target paths, request bodies, ciphertext, or plaintext. Logs are mode `0600`
-and pruned after 14 days. The page discloses this telemetry.
+and retained for 14 days. Normal records are append-only; bounded retention
+maintenance runs at startup and through the existing periodic sweeper. The page
+discloses this telemetry. Page views and routine pending claim polls are not
+persisted.
 
 This is minimal abuse/usage observation, not access control. If you expose the
 service publicly, expect unrelated traffic and rate-limit responses.
@@ -107,6 +113,10 @@ service publicly, expect unrelated traffic and rate-limit responses.
 ## API
 
 All API responses use `Cache-Control: no-store`.
+State-changing endpoints require `Content-Type: application/json` (normal
+parameters such as `charset=utf-8` are accepted). Other media types receive
+`415 unsupported_media_type` before rate-limit or drop-state mutation. The
+service does not emit permissive CORS headers.
 
 | Method | Path | Purpose |
 |---|---|---|
