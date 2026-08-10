@@ -7,7 +7,8 @@
 
 **A human can deliver a credential to an approved agent-side destination without
 putting its plaintext—or a decryption capability—into chat, model context, or
-normal tool output.**
+normal tool output. The same relay lets the agent hand a secret back out for a
+one-time browser reveal.**
 
 ## Why this exists
 
@@ -15,8 +16,9 @@ Pasting an API key into an AI chat burns it into conversation history and model
 context. Existing secret managers often let an agent read a secret value, while
 generic one-time secret sharing gives the recipient a bearer decryption link.
 
-`shh` is deliberately narrower: safe **secret ingress** for an agent workflow.
-It gets a human-provided value into a declared destination silently. It is not a
+`shh` is deliberately narrower: safe **secret ingress and egress** for an agent
+workflow. It gets a human-provided value into a declared destination silently,
+and it can hand a value back out for a one-time browser reveal. It is not a
 vault and it is not a general-purpose agent credential broker.
 
 ## Product decision: scope of v1

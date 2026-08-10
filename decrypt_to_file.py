@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from nacl.public import PrivateKey, SealedBox
+from nacl.secret import SecretBox
+from nacl import utils
 
 
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -240,6 +242,55 @@ def receive(relay: str, name: str, target: Path | str, poll_interval: float = 2.
         return 3
 
 
+def release(
+    relay: str,
+    secret: str,
+) -> int:
+    """Publish one secret for a human to reveal once via the browser.
+
+    The agent holds the secret (e.g. from a file or a generated value) and
+    wants to hand it to the human without putting the plaintext in chat,
+    model context, or normal tool output. This helper encrypts the secret
+    with a fresh symmetric key, submits only ciphertext to the blind relay,
+    and prints a reveal link whose fragment carries the drop id and the key.
+    The human opens the reveal page, which claims the drop once, decrypts in
+    the browser, and shows the plaintext. Returns a process exit code.
+    """
+    try:
+        relay = relay.rstrip("/")
+        status, created = _json_request(_relay_url(relay, "/api/drops"), "POST", {})
+        if status != 201 or not isinstance(created, dict):
+            print("error: relay could not create a drop", file=sys.stderr)
+            return 3
+        drop_id = created.get("id")
+        if not isinstance(drop_id, str):
+            print("error: relay returned an invalid drop", file=sys.stderr)
+            return 3
+
+        key = utils.random(SecretBox.KEY_SIZE)
+        encrypted = SecretBox(key).encrypt(secret.encode("utf-8"))
+        payload = _b64url(bytes(encrypted))
+        status, _ = _json_request(
+            _relay_url(relay, f"/api/drops/{drop_id}/payload"),
+            "POST",
+            {"v": 1, "payload": payload},
+        )
+        if status != 204:
+            print("error: relay rejected the secret payload", file=sys.stderr)
+            return 3
+
+        link = f"{relay}/reveal#{drop_id}.{_b64url(bytes(key))}"
+        print(f"shh reveal link: {link}", flush=True)
+        return 0
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception:
+        # Do not surface library/network exceptions: they can contain request data.
+        print("error: release failed without publishing the secret", file=sys.stderr)
+        return 3
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="shh")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -248,9 +299,20 @@ def main() -> int:
     receiver.add_argument("--name", required=True, help="environment variable name")
     receiver.add_argument("--target", required=True, help="absolute path whose basename is .env")
     receiver.add_argument("--poll-interval", type=float, default=2.0)
+    releaser = subparsers.add_parser("release", help="publish one secret for a one-time browser reveal")
+    releaser.add_argument("--relay", required=True, help="shh relay origin")
+    releaser.add_argument(
+        "--secret",
+        help="secret to publish (omit to read from stdin; piping avoids argv/process-list exposure)",
+    )
     args = parser.parse_args()
     if args.command == "receive":
         return receive(args.relay, args.name, args.target, args.poll_interval)
+    if args.command == "release":
+        secret = args.secret
+        if secret is None:
+            secret = sys.stdin.read()
+        return release(args.relay, secret)
     return 2
 
 

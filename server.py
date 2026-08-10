@@ -304,6 +304,35 @@ button:disabled{{opacity:.5}} #status{{margin-top:16px;white-space:pre-wrap;back
 </body></html>""", nonce
 
 
+def _build_reveal_page(ttl: float) -> tuple[str, str]:
+    nonce = secrets.token_urlsafe(18)
+    ttl_min = max(1, int(round(ttl / 60)))
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>shh — reveal secret</title>
+<meta name="description" content="Reveal a one-time secret delivered by the agent.">
+<style>
+body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:640px;margin:40px auto;padding:0 20px;line-height:1.6}}
+h1{{font-size:1.6rem}} h2{{font-size:1.1rem;margin-top:28px}}
+textarea{{width:100%;height:150px;background:#1a1d24;color:#e6e6e6;border:1px solid #333;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;box-sizing:border-box}}
+button{{margin-top:12px;padding:10px 18px;border:0;border-radius:8px;background:#4f8cff;color:#fff;font-size:1rem;cursor:pointer}}
+button:disabled{{opacity:.5}} #status{{margin-top:16px;white-space:pre-wrap;background:#1a1d24;padding:12px;border-radius:8px;display:none}}
+.note{{font-size:.86rem;color:#aeb4c0;margin-top:24px}} .alert{{background:#1f2a2a;border:1px solid #3a5a5a;padding:10px 14px;border-radius:8px;margin-top:20px;font-size:.9rem}}
+</style></head><body>
+<h1>🔓 shh reveal</h1>
+<p>A secret was delivered through the relay for you. This link works once and expires after {ttl_min} minute(s).</p>
+<button id="reveal" type="button">Reveal secret</button>
+<div id="status" role="status"></div>
+<h2 id="secret-heading" hidden>Secret (will be clipped shortly)</h2>
+<textarea id="secret" autocomplete="off" spellcheck="false" readonly hidden></textarea>
+<p class="note">The relay stores only ciphertext and deletes it after a single claim. For abuse monitoring, this service records a short-lived pseudonymous client identifier, timestamp, event, and status. It does not record secret contents, links, or drop IDs.</p>
+<div class="alert"><b>Trust boundary:</b> keep this link private until you reveal it. Anyone who opens it before you can claim the secret, and once claimed it is gone.</div>
+<script type="importmap" nonce="{nonce}">{{"imports":{{"libsodium":"/static/libsodium.mjs"}}}}</script>
+<script type="module" nonce="{nonce}" src="/static/app_reveal.js"></script>
+</body></html>""", nonce
+
+
 class DropHandler(BaseHTTPRequestHandler):
     store: DropStore
     create_limiter: RateLimiter
@@ -409,6 +438,22 @@ class DropHandler(BaseHTTPRequestHandler):
                 {"Content-Security-Policy": csp},
             )
             return
+        if path == "/reveal":
+            page, nonce = _build_reveal_page(self.secret_ttl)
+            body = page.encode("utf-8")
+            csp = (
+                "default-src 'none'; script-src 'self' 'nonce-"
+                + nonce
+                + "' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'none'"
+            )
+            self._send(
+                200,
+                body,
+                "text/html; charset=utf-8",
+                {"Content-Security-Policy": csp},
+            )
+            return
         if path == "/robots.txt":
             self._send(200, b"User-agent: *\nAllow: /\n", "text/plain; charset=utf-8")
             return
@@ -417,7 +462,7 @@ class DropHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/static/"):
             filename = path.removeprefix("/static/")
-            allowed = {"app.js": STATIC_ROOT / "app.js", "libsodium.mjs": VENDOR_ROOT / "libsodium.mjs", "libsodium-wrappers.mjs": VENDOR_ROOT / "libsodium-wrappers.mjs"}
+            allowed = {"app.js": STATIC_ROOT / "app.js", "app_reveal.js": STATIC_ROOT / "app_reveal.js", "libsodium.mjs": VENDOR_ROOT / "libsodium.mjs", "libsodium-wrappers.mjs": VENDOR_ROOT / "libsodium-wrappers.mjs"}
             file_path = allowed.get(filename)
             if file_path is None or not file_path.is_file():
                 self._json({"error": "not_found"}, 404)

@@ -220,3 +220,86 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
                     timeout=3,
                     phase="receiver cleanup",
                 )
+
+
+def test_browser_reveals_agent_released_secret_once(tmp_path):
+    usage_log = tmp_path / "usage.jsonl"
+    httpd = server.make_server(
+        "127.0.0.1",
+        0,
+        ttl=60,
+        usage_log_path=usage_log,
+        usage_key=b"browser-reveal-test-usage-key-not-secret",
+        posts_per_minute=20,
+    )
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_port}"
+    secret = "browser-reveal-secret-must-not-appear-in-captured-output"
+
+    # Agent publishes the secret via the release helper.
+    release = subprocess.run(
+        [
+            sys.executable,
+            "decrypt_to_file.py",
+            "release",
+            "--relay",
+            base,
+        ],
+        input=secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert release.returncode == 0, (release.stdout, release.stderr)
+    assert secret not in release.stdout and secret not in release.stderr
+    link_line = next(
+        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
+    )
+    link = link_line.removeprefix("shh reveal link: ").strip()
+
+    console_errors: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            revealed = page.locator("#secret").input_value()
+            assert revealed == secret
+            assert page.locator("#secret-heading").is_visible()
+            browser.close()
+
+        # Second reveal attempt in a fresh page must fail (single use).
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.wait_for_function(
+                "document.querySelector('#status').textContent.includes('already been claimed')",
+                timeout=10000,
+            )
+            assert page.locator("#secret").is_hidden()
+            browser.close()
+
+        assert not console_errors, console_errors
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=2)
+        httpd.server_close()
+

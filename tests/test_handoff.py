@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 import pytest
 from dotenv import dotenv_values
 from nacl.public import PrivateKey, SealedBox
+from nacl.secret import SecretBox
 
 import server
 from decrypt_to_file import write_env_value
@@ -508,3 +509,81 @@ def test_receiver_cli_stdout_and_stderr_never_contain_plaintext(tmp_path):
     assert secret not in result.stdout
     assert secret not in result.stderr
     assert "TOKEN" in result.stdout or "relay" in result.stderr.lower()
+
+
+def test_release_cli_publishes_ciphertext_and_prints_reveal_link(app_server):
+    base, usage_log = app_server
+    secret = "release-test-secret-must-not-appear-in-output"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "decrypt_to_file.py",
+            "release",
+            "--relay",
+            base,
+        ],
+        input=secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+
+    link_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith("shh reveal link: ")),
+        None,
+    )
+    assert link_line is not None, result.stdout
+    link = link_line.removeprefix("shh reveal link: ").strip()
+    assert link.startswith(base + "/reveal#")
+    fragment = link.split("#", 1)[1]
+    drop_id, _, key_b64 = fragment.partition(".")
+    assert drop_id and key_b64
+
+    # The published drop is claimable once and decrypts to the secret.
+    status, body = request_json(
+        f"{base}/api/drops/{drop_id}/claim", method="POST", body={}
+    )
+    assert status == 200
+    assert body["v"] == 1
+    combined = base64.urlsafe_b64decode(body["payload"] + "==")
+    key = base64.urlsafe_b64decode(key_b64 + "==")
+    plaintext = SecretBox(key).decrypt(combined).decode("utf-8")
+    assert plaintext == secret
+
+    # Second claim is not_found (single use).
+    status, body = error_json(
+        f"{base}/api/drops/{drop_id}/claim", method="POST", body={}
+    )
+    assert status == 404
+    assert body == {"error": "not_found"}
+
+    log_text = usage_log.read_text()
+    assert secret not in log_text
+    assert key_b64 not in log_text
+    assert drop_id not in log_text
+
+
+def test_release_cli_accepts_secret_via_argv_without_plaintext_leak(app_server):
+    base, _ = app_server
+    secret = "argv-release-secret-must-not-leak"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "decrypt_to_file.py",
+            "release",
+            "--relay",
+            base,
+            "--secret",
+            secret,
+        ],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert result.stdout.strip().startswith("shh reveal link: ")

@@ -26,6 +26,31 @@ Hermes sees only a redacted delivery receipt
 It is not a vault, identity provider, credential broker, or general file-write
 primitive.
 
+### Reverse direction: agent → human (`release`)
+
+The same relay supports handing a secret back out to a human without putting
+plaintext in chat or model context:
+
+```text
+agent encrypts a value with a fresh symmetric key and uploads ciphertext
+        |
+        v
+agent prints a single-use reveal link carrying the drop id and the key
+        |
+        v
+human opens /reveal#<drop_id>.<key> and clicks "Reveal secret"
+        |
+        v
+browser claims the drop once, decrypts locally, shows the value, then clips it
+```
+
+Unlike ingress, the reveal link's fragment carries both the drop id **and** the
+decryption key, so the link itself is the capability. Anyone who opens it before
+the intended recipient claims the secret. The single-use claim then deletes the
+ciphertext from the relay, so a key recovered later from a chat log cannot
+decrypt anything that no longer exists. Treat reveal links as live-only: share
+them privately and have the recipient claim promptly.
+
 ## Components and trust boundaries
 
 The personal-use milestone has one HTTP origin:
