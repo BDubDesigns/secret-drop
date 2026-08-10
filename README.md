@@ -66,20 +66,23 @@ values, and `${...}` interpolation syntax are rejected rather than transformed.
 
 ## Deployment
 
-The included Dockerfile installs the runtime dependency and binds the service
-for a reverse proxy:
+The included Dockerfile declares `/app/data` as its data path, writes telemetry
+there by default, and binds the service for a reverse proxy:
 
 ```bash
 docker build -t shh .
-docker run --rm -p 8899:8899 -v shh-data:/app/data shh \
-  python3 server.py --host 0.0.0.0 --port 8899 \
-  --usage-log /app/data/usage.jsonl
+docker run --rm -p 8899:8899 -v shh-data:/app/data shh
 ```
 
-For Coolify, put the service behind HTTPS and keep the usage log on a private
-persistent volume. The image defaults to not trusting forwarded headers. If
-Coolify is the immediate proxy, explicitly enable proxy trust and set the CIDR
-of the proxy network, for example:
+For Coolify, add a **Persistent Storage** volume with a descriptive name (for
+example `shh-data`) and destination path `/app/data`. Coolify namespaces the
+volume for the resource and keeps it across deployments. Dockerfile `VOLUME`
+metadata establishes the portable default path, but it does not create or
+manage Coolify's resource-level persistent-volume setting.
+
+The image defaults to not trusting forwarded headers. If Coolify is the
+immediate proxy, explicitly enable proxy trust and set the CIDR of the proxy
+network, for example:
 
 ```text
 --trust-proxy --trusted-proxy-cidr 172.16.0.0/12
