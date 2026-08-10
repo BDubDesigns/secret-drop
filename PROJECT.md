@@ -23,11 +23,11 @@ vault and it is not a general-purpose agent credential broker.
 
 Build **transcript-safe encrypted delivery**, not hostile-agent containment.
 
-`shh` protects against:
+For the expected, unmodified implementation, `shh` protects against:
 
 - plaintext in chat history or model context;
 - plaintext in normal tool output / helper stdout or stderr;
-- a hosted relay reading the secret;
+- a hosted relay reading the ciphertext as if it were plaintext;
 - ordinary persistent relay storage of plaintext.
 
 `shh` does **not** claim to protect a secret after delivery from a malicious
@@ -35,6 +35,22 @@ agent, malware, or any process with the same OS-level access to the destination.
 If a secret is written to `.env`, an agent with unrestricted filesystem access
 can read it. Stronger containment requires a separately isolated,
 operation-scoped credential broker and is explicitly out of scope for v1.
+
+### Personal-use milestone trust boundary
+
+The first implementation is for Brandon's own Hermes handoffs. It uses one
+same-origin service for the browser page and relay, with no account or
+authentication gate. This keeps deployment cheap and preserves the important
+transcript-safe property, but it adds one explicit limitation: a compromised
+relay that can replace the page's JavaScript can capture a new plaintext before
+encryption. A future stronger deployment can split the static sender page from
+the relay origin; that is not required for this personal-use milestone.
+
+The unauthenticated endpoint is expected to receive scanners and unrelated
+traffic. Per-client rate limits and short-lived, keyed-HMAC IP telemetry are
+for abuse/usage observation only; they are not access control. Raw client IPs,
+request bodies, URLs/fragments, drop IDs, target paths, variable names, keys,
+ciphertext, and plaintext are not logged.
 
 ## The key v1 improvement over the existing prototype
 
@@ -88,7 +104,7 @@ Agent receives a redacted success receipt only
 
 ### Security invariants
 
-- Plaintext is never sent to the relay.
+- Plaintext is never sent to the relay when the expected browser code is served.
 - The receiver private key is never put in a chat-visible URL, normal tool
   response, or relay request.
 - Browser-facing URLs contain no secret-equivalent decryption capability.
@@ -100,6 +116,8 @@ Agent receives a redacted success receipt only
 - Client and relay responses use `Cache-Control: no-store`.
 - Bound input size, short TTL, one-time claim semantics, bounded storage, and
   per-IP creation rate limiting remain in place.
+- Usage telemetry is local, access-restricted, pseudonymous, and retained only
+  for a short operational window.
 
 ### Quality / verification
 
@@ -123,8 +141,8 @@ Agent receives a redacted success receipt only
 
 ## Technical constraints and starting point
 
-- Existing prototype is Python stdlib HTTP plus `cryptography` in
-  `server.py` and `decrypt_to_file.py`.
+- Existing prototype is Python stdlib HTTP plus a Python crypto dependency in
+  `server.py` and `decrypt_to_file.py`; v1 uses PyNaCl/libsodium sealed boxes.
 - Existing public repository: https://github.com/BDubDesigns/secret-drop
 - Existing behavior already has RAM-only storage, one-time claims, TTL,
   bounded payload/storage, creation rate limiting, and `no-store` headers.

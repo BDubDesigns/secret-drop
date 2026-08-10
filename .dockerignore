@@ -1,0 +1,10 @@
+.git/
+.github/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+usage.jsonl
+tests/
+requirements-dev.txt
+pytest.ini
