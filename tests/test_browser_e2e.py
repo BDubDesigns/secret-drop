@@ -377,3 +377,54 @@ def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
         thread.join(timeout=2)
         httpd.server_close()
 
+def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
+    """HTML-like plaintext must be shown as text, never injected into the DOM."""
+    usage_log = tmp_path / "usage.jsonl"
+    httpd = server.make_server(
+        "127.0.0.1",
+        0,
+        ttl=60,
+        usage_log_path=usage_log,
+        usage_key=b"browser-xss-test-usage-key-not-secret",
+        posts_per_minute=20,
+    )
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_port}"
+    payload_secret = "<script>window.__xss=2</script>"
+
+    release = subprocess.run(
+        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
+        input=payload_secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert release.returncode == 0, (release.stdout, release.stderr)
+    link_line = next(
+        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
+    )
+    link = link_line.removeprefix("shh reveal link: ").strip()
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            # The plaintext must round-trip byte-for-byte as inert text…
+            assert page.locator("#secret").input_value() == payload_secret
+            # …and no element outside the textarea may have been injected.
+            assert page.evaluate("window.__xss === undefined")
+            # The status element must not have interpreted the payload as HTML.
+            assert page.locator("#status img").count() == 0
+            assert page.locator("#status script").count() == 0
+            browser.close()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=2)
+        httpd.server_close()

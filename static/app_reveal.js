@@ -85,18 +85,22 @@ button.addEventListener("click", async () => {
       body: "{}",
     });
     if (response.status === 202) {
+      // Not delivered yet — the drop is untouched, retry is legitimate.
       show("The secret has not been delivered yet. Try again shortly.", true);
       button.disabled = false;
       return;
     }
-    claimed = true; // 404/429/4xx/5xx/200 all mean this drop is spent or spent-ish
-    if (response.status === 404) {
-      show("This secret has already been claimed or has expired.", true);
-      return;
-    }
     if (response.status === 429) {
+      // Rate-limited — the drop is untouched, retry is legitimate.
       show("Too many attempts. Wait a minute and try again.", true);
       button.disabled = false;
+      return;
+    }
+    // From here the drop is spent or spent-ish: 404 means it is gone, and any
+    // 4xx/5xx/200 response means the claim was answered. Retry cannot help.
+    claimed = true;
+    if (response.status === 404) {
+      show("This secret has already been claimed or has expired.", true);
       return;
     }
     if (!response.ok) {
