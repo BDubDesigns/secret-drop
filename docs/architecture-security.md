@@ -1,30 +1,15 @@
-# shh personal-use architecture and security
+# shh architecture and security
 
 ## What this is for
 
-`shh` is a narrow secret-ingress tool for one workflow:
+`shh` is a small, open-source, self-hostable, one-time secret bridge between
+humans and AI agents. The hosted deployment at `https://shh.qcfailed.com` is a
+best-effort public instance/demo with no account or SLA.
 
-```text
-Brandon requests GITHUB_TOKEN -> an approved .env target
-        |
-        v
-receiver creates a one-time keypair and prints a public delivery link
-        |
-        v
-human opens the link and pastes the token in a browser
-        |
-        v
-browser encrypts to the receiver public key and uploads ciphertext
-        |
-        v
-receiver claims ciphertext, decrypts locally, and atomically updates .env
-        |
-        v
-Hermes sees only a redacted delivery receipt
-```
-
-It is not a vault, identity provider, credential broker, or general file-write
-primitive.
+A human can deliver a value to a declared agent-side destination without putting
+plaintext into chat, model context, or normal tool output. An agent can also hand
+a value back out for a one-time browser reveal. It is not a vault, identity
+provider, credential broker, or general file-write primitive.
 
 ### Reverse direction: agent → human (`release`)
 
@@ -41,7 +26,10 @@ agent prints a single-use reveal link carrying the drop id and the key
 human opens /reveal#<drop_id>.<key> and clicks "Reveal secret"
         |
         v
-browser claims the drop once, decrypts locally, shows the value, then clips it
+browser claims the drop once, removes the capability fragment, and shows the value
+        |
+        v
+human can copy or hide it; background/page exit and a 120-second fallback clear it
 ```
 
 Unlike ingress, the reveal link's fragment carries both the drop id **and** the
@@ -51,9 +39,16 @@ ciphertext from the relay, so a key recovered later from a chat log cannot
 decrypt anything that no longer exists. Treat reveal links as live-only: share
 them privately and have the recipient claim promptly.
 
+The reveal page removes the capability fragment immediately after successful
+browser decryption and before exposing the plaintext in its controls. **Copy
+secret** is always user-initiated; it intentionally moves plaintext into a system
+clipboard outside the page's control. **Hide now**, background/page-exit cleanup,
+and the bounded 120-second fallback are screen/privacy hygiene, not a security
+boundary.
+
 ## Components and trust boundaries
 
-The personal-use milestone has one HTTP origin:
+The hosted best-effort instance and a self-hosted deployment use one HTTP origin:
 
 ```text
 same origin
