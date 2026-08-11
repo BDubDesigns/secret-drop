@@ -27,6 +27,30 @@ def output_text(value: str | bytes | None) -> str:
     return value or ""
 
 
+def release_link(base: str, secret: str) -> str:
+    result = subprocess.run(
+        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
+        input=secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError("release helper failed; protected diagnostics withheld")
+    assert_plaintext_absent(
+        secret,
+        ("release stdout", result.stdout),
+        ("release stderr", result.stderr),
+    )
+    line = next(
+        (value for value in result.stdout.splitlines() if value.startswith("shh reveal link: ")),
+        None,
+    )
+    if line is None:
+        raise AssertionError("release helper did not emit a reveal link")
+    return line.removeprefix("shh reveal link: ").strip()
+
+
 def drain_receiver_output(
     receiver: subprocess.Popen[str], plaintext: str, initial_stdout: str, *, timeout: float, phase: str
 ) -> tuple[str, str]:
@@ -224,43 +248,13 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
 
 
 def test_browser_reveals_agent_released_secret_once(tmp_path):
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-reveal-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     secret = "browser-reveal-secret-must-not-appear-in-captured-output"
 
-    # Agent publishes the secret via the release helper.
-    release = subprocess.run(
-        [
-            sys.executable,
-            "decrypt_to_file.py",
-            "release",
-            "--relay",
-            base,
-        ],
-        input=secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    assert secret not in release.stdout and secret not in release.stderr
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
+    with browser_test_relay(tmp_path) as (base, _):
+        # Agent publishes the secret via the release helper.
+        link = release_link(base, secret)
 
-    console_errors: list[str] = []
-    try:
+        console_errors: list[str] = []
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -307,42 +301,15 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
             browser.close()
 
         assert not console_errors, console_errors
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()
 
 def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
     """A malformed link key must fail before claiming, leaving the drop alive."""
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-truncated-key-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     secret = "truncated-key-secret"
 
-    release = subprocess.run(
-        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
-        input=secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
-    drop_id, key = link.split("#", 1)[1].split(".", 1)
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        drop_id, key = link.split("#", 1)[1].split(".", 1)
 
-    try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -372,41 +339,15 @@ def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
             assert response.status == 200, response.status
             body = json.loads(response.read())
         assert body.get("v") == 1 and isinstance(body.get("payload"), str)
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()
+
 
 def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
     """HTML-like plaintext must be shown as text, never injected into the DOM."""
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-xss-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     payload_secret = "<script>window.__xss=2</script>"
 
-    release = subprocess.run(
-        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
-        input=payload_secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, payload_secret)
 
-    try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -424,7 +365,3 @@ def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
             assert page.locator("#status img").count() == 0
             assert page.locator("#status script").count() == 0
             browser.close()
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()
