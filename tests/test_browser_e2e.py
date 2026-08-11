@@ -27,6 +27,30 @@ def output_text(value: str | bytes | None) -> str:
     return value or ""
 
 
+def release_link(base: str, secret: str) -> str:
+    result = subprocess.run(
+        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
+        input=secret,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise AssertionError("release helper failed; protected diagnostics withheld")
+    assert_plaintext_absent(
+        secret,
+        ("release stdout", result.stdout),
+        ("release stderr", result.stderr),
+    )
+    line = next(
+        (value for value in result.stdout.splitlines() if value.startswith("shh reveal link: ")),
+        None,
+    )
+    if line is None:
+        raise AssertionError("release helper did not emit a reveal link")
+    return line.removeprefix("shh reveal link: ").strip()
+
+
 def drain_receiver_output(
     receiver: subprocess.Popen[str], plaintext: str, initial_stdout: str, *, timeout: float, phase: str
 ) -> tuple[str, str]:
@@ -101,6 +125,112 @@ def browser_test_relay(tmp_path):
         httpd.server_close()
 
 
+def test_bare_root_onboards_human_and_agent(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        console_errors: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.goto(base + "/", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("No handoff link detected", exact=False)).to_be_visible()
+            expect(page.get_by_text("Human → Agent", exact=True)).to_be_visible()
+            expect(page.get_by_text("Agent → Human", exact=True)).to_be_visible()
+            expect(page.locator('a[href="/agent.md"]')).to_be_visible()
+            expect(page.locator("#agent-url")).to_have_text(f"{base}/agent.md")
+            assert page.locator('a[href="https://github.com/BDubDesigns/secret-drop"]').count() >= 1
+            assert page.locator('a[href="https://qcfailed.com"]').count() >= 1
+            assert not console_errors
+            browser.close()
+
+
+def test_malformed_fragment_stays_in_landing_mode(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        requests: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on("request", lambda request: requests.append(request.url))
+            page.goto(base + "/#truncated", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("incomplete or invalid", exact=False)).to_be_visible()
+            expect(page.get_by_text("fresh link", exact=False)).to_be_visible()
+            assert page.locator("#send").is_disabled()
+            assert not any(url.endswith("/payload") for url in requests)
+            browser.close()
+
+
+def test_truncated_public_key_stays_in_landing_mode(tmp_path):
+    drop_id = "A" * 20
+    truncated_key = "A" * 42  # URL-safe base64 that decodes to 31 bytes.
+
+    with browser_test_relay(tmp_path) as (base, _):
+        requests: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on("request", lambda request: requests.append(request.url))
+            page.goto(f"{base}/#{drop_id}.{truncated_key}", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("incomplete or invalid", exact=False)).to_be_visible()
+            assert page.locator("#send").is_disabled()
+            assert not any(url.endswith("/payload") for url in requests)
+            browser.close()
+
+
+def test_landing_is_responsive_and_keyboard_reachable(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        console_errors: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.goto(base + "/", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#human-agent-title")).to_be_visible()
+            expect(page.locator("#agent-human-title")).to_be_visible()
+            expect(page.locator('a[href="/agent.md"]')).to_be_visible()
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            reached_agent_link = False
+            for _ in range(20):
+                page.keyboard.press("Tab")
+                if page.locator(":focus").get_attribute("href") == "/agent.md":
+                    reached_agent_link = True
+                    break
+            assert reached_agent_link
+            assert not console_errors
+            browser.close()
+
+
 def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
     with browser_test_relay(tmp_path) as (base, usage_log):
         target = tmp_path / ".env"
@@ -164,6 +294,9 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
                         )
                         page.on("pageerror", lambda error: console_errors.append(str(error)))
                         page.goto(link, wait_until="networkidle")
+                        expect(page.locator("#landing")).to_be_hidden()
+                        expect(page.locator("#delivery")).to_be_visible()
+                        expect(page.locator("#send")).to_be_enabled()
                         page.locator("#input").fill(secret)
                         page.locator("#send").click()
                         page.locator("#status").filter(
@@ -224,43 +357,13 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
 
 
 def test_browser_reveals_agent_released_secret_once(tmp_path):
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-reveal-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     secret = "browser-reveal-secret-must-not-appear-in-captured-output"
 
-    # Agent publishes the secret via the release helper.
-    release = subprocess.run(
-        [
-            sys.executable,
-            "decrypt_to_file.py",
-            "release",
-            "--relay",
-            base,
-        ],
-        input=secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    assert secret not in release.stdout and secret not in release.stderr
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
+    with browser_test_relay(tmp_path) as (base, _):
+        # Agent publishes the secret via the release helper.
+        link = release_link(base, secret)
 
-    console_errors: list[str] = []
-    try:
+        console_errors: list[str] = []
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -283,13 +386,16 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
             page.locator("#secret").wait_for(state="visible", timeout=10000)
             revealed = page.locator("#secret").input_value()
             assert revealed == secret
+            assert "#" not in page.url
+            expect(page.locator("#copy-secret")).to_be_visible()
+            expect(page.locator("#hide-secret")).to_be_visible()
             assert page.locator("#secret-heading").is_visible()
             # The secret must actually clip itself, and the key-carrying
             # fragment must be removed from the URL afterwards.
             page.locator("#secret").wait_for(state="hidden", timeout=10000)
             assert page.locator("#secret").input_value() == ""
             assert "#" not in page.url
-            assert "clipped" in page.locator("#status").text_content().lower()
+            assert "hidden" in page.locator("#status").text_content().lower()
             browser.close()
 
         # Second reveal attempt in a fresh page must fail (single use).
@@ -307,42 +413,15 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
             browser.close()
 
         assert not console_errors, console_errors
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()
 
 def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
     """A malformed link key must fail before claiming, leaving the drop alive."""
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-truncated-key-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     secret = "truncated-key-secret"
 
-    release = subprocess.run(
-        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
-        input=secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
-    drop_id, key = link.split("#", 1)[1].split(".", 1)
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        drop_id, key = link.split("#", 1)[1].split(".", 1)
 
-    try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -372,41 +451,107 @@ def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
             assert response.status == 200, response.status
             body = json.loads(response.read())
         assert body.get("v") == 1 and isinstance(body.get("payload"), str)
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()
+
+
+def test_browser_reveal_supports_explicit_hide(tmp_path):
+    secret = "explicit-hide-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.locator("#hide-secret").click()
+            assert page.locator("#secret").is_hidden()
+            assert page.locator("#secret").input_value() == ""
+            assert page.locator("#secret-actions").is_hidden()
+            expect(page.locator("#status")).to_contain_text("hidden")
+            assert secret not in (page.locator("#status").text_content() or "")
+            browser.close()
+
+
+def test_browser_reveal_supports_user_initiated_copy(tmp_path):
+    secret = "explicit-copy-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            context = browser.new_context()
+            context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base)
+            page = context.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.locator("#copy-secret").click()
+            expect(page.locator("#status")).to_contain_text("outside shh's control")
+            clipboard = page.evaluate("navigator.clipboard.readText()")
+            if clipboard != secret:
+                raise AssertionError("clipboard did not receive the revealed value")
+            browser.close()
+
+
+def test_browser_reveal_clears_on_pagehide(tmp_path):
+    secret = "pagehide-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+            assert page.locator("#secret").is_hidden()
+            assert page.locator("#secret").input_value() == ""
+            assert page.locator("#secret-actions").is_hidden()
+            expect(page.locator("#status")).to_contain_text("hidden")
+            browser.close()
+
+
+def test_browser_reveal_clamps_timer_override_to_production_fallback(tmp_path):
+    secret = "timer-clamp-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        path, _, fragment = link.partition("#")
+        long_link = f"{path}?clip=999999#{fragment}"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(long_link, wait_until="networkidle")
+            assert "?clip=999999#" in page.url
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            expect(page.locator("#status")).to_contain_text("120 seconds")
+            assert "?clip=999999" in page.url
+            assert "#" not in page.url
+            browser.close()
+
 
 def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
     """HTML-like plaintext must be shown as text, never injected into the DOM."""
-    usage_log = tmp_path / "usage.jsonl"
-    httpd = server.make_server(
-        "127.0.0.1",
-        0,
-        ttl=60,
-        usage_log_path=usage_log,
-        usage_key=b"browser-xss-test-usage-key-not-secret",
-        posts_per_minute=20,
-    )
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    base = f"http://127.0.0.1:{httpd.server_port}"
     payload_secret = "<script>window.__xss=2</script>"
 
-    release = subprocess.run(
-        [sys.executable, "decrypt_to_file.py", "release", "--relay", base],
-        input=payload_secret,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert release.returncode == 0, (release.stdout, release.stderr)
-    link_line = next(
-        line for line in release.stdout.splitlines() if line.startswith("shh reveal link: ")
-    )
-    link = link_line.removeprefix("shh reveal link: ").strip()
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, payload_secret)
 
-    try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
@@ -424,7 +569,3 @@ def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
             assert page.locator("#status img").count() == 0
             assert page.locator("#status script").count() == 0
             browser.close()
-    finally:
-        httpd.shutdown()
-        thread.join(timeout=2)
-        httpd.server_close()

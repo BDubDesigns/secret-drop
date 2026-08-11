@@ -1,38 +1,48 @@
 # shh
 
-`shh` is a small, self-hostable secret-ingress tool for Brandon's Hermes
-handoffs. It moves one human-provided environment variable into one declared
-`.env` file without putting the plaintext in Discord, model context, normal tool
-output, or relay storage.
+**A one-time secret bridge for humans and AI agents.**
 
-This milestone is for personal use. It has no accounts and no authentication
-wall. It is rate-limited and will still receive scanners and random traffic
-when exposed to the internet.
+`shh` keeps plaintext out of chat and model context while a declared receiver or
+human claims it once. It is open source, MIT licensed, and self-hostable.
+
+- **Hosted demo:** [shh.qcfailed.com](https://shh.qcfailed.com) — best effort,
+  with no account or SLA
+- **Agent guide:** [shh.qcfailed.com/agent.md](https://shh.qcfailed.com/agent.md)
+- **Source:** [github.com/BDubDesigns/secret-drop](https://github.com/BDubDesigns/secret-drop)
+- **Security model:**
+  [`docs/architecture-security.md`](docs/architecture-security.md)
+
+The hosted instance is a public demo, not a credential vault, identity provider,
+team product, or hosted secrets SaaS. The expected browser implementation
+encrypts before upload and gives the relay only opaque ciphertext. Because the
+hosted page and relay share an origin, a compromised or malicious operator could
+replace the JavaScript and capture a future plaintext before encryption. Self-host
+when that trust boundary matters.
 
 ## How it works
 
 ```text
-receiver helper creates a one-time keypair
-        ↓ public key only in a delivery URL fragment
-human opens the link and pastes a secret
-        ↓ libsodium sealed box in the browser
-relay stores opaque ciphertext in RAM
-        ↓ one-time claim
-receiver decrypts locally and atomically writes one .env variable
+Human → Agent
+agent creates a receiver keypair and public delivery link
+        ↓
+human opens the complete link and encrypts in the browser
+        ↓
+relay stores opaque ciphertext; receiver decrypts locally and writes one .env value
+
+Agent → Human
+agent reads a value from stdin and publishes ciphertext
+        ↓
+human opens a one-time reveal link and claims it in the browser
+        ↓
+browser decrypts locally, removes the capability fragment, and shows the value
 ```
 
-The receiver private key never enters the link, a request, or normal output.
-The browser uses the receiver public key with libsodium's `crypto_box_seal`.
-The relay cannot decrypt ciphertext under the expected page implementation.
+The receiver private key never enters the delivery link, a request, or normal
+output. The reverse reveal link is different: its fragment carries the drop ID
+and decryption key, so the link is a live bearer capability until it is claimed.
+Keep it private and send it through an appropriate channel.
 
-### Important trust boundary
-
-This personal-use deployment serves the browser page and relay from the same
-origin. A compromised relay could replace the JavaScript page and capture a new
-plaintext before encryption. That is intentionally a narrower claim than a
-separate sender origin; see [`docs/architecture-security.md`](docs/architecture-security.md).
-
-## Local quick start
+## Human → Agent quick start
 
 Requires Python 3.12+.
 
@@ -42,162 +52,143 @@ python3 -m venv .venv
 .venv/bin/python server.py --port 8899 --ttl 1800
 ```
 
-In another terminal, request a handoff. The target must be an absolute path
-whose basename is `.env`; its parent directory must already exist.
+In another terminal, request a handoff. The target must be an absolute path whose
+basename is `.env`; its parent directory must already exist.
 
 ```bash
 .venv/bin/python decrypt_to_file.py receive \
   --relay http://127.0.0.1:8899 \
-  --name GITHUB_TOKEN \
+  --name EXPECTED_VARIABLE \
   --target /absolute/path/to/.env
 ```
 
-The helper prints a public delivery link. Open it in a browser, paste the
-credential, and click **Encrypt & deliver**. The helper prints only:
+For the hosted demo, use `https://shh.qcfailed.com` as the relay origin. The
+helper prints a public delivery link. Send the complete clickable URL, including
+the fragment after `#`, to the human. The human pastes the value into the browser
+and clicks **Encrypt & deliver**. The receiver decrypts locally and prints only a
+redacted receipt:
 
 ```text
-ok: delivered GITHUB_TOKEN to the approved target.
+ok: delivered EXPECTED_VARIABLE to the approved target.
 ```
 
-The value is written atomically with target mode `0600`. It is never printed by the helper.
-Values accepted by `shh` load exactly under normal python-dotenv/Hermes semantics:
-ordinary `$`, backticks, backslashes, and quotes round-trip. NULs, multiline
-values, and `${...}` interpolation syntax are rejected rather than transformed.
+The value is written atomically with target mode `0600`. It is never printed by
+the helper.
 
-### Reverse handoff: agent → human (`release`)
+## Agent → Human quick start
 
-To hand a secret **back out** to a human without putting plaintext in chat,
-publish it for a one-time browser reveal. Read the value from stdin — never
-embed the literal in the command line (argv leaks via `/proc/*/cmdline`, shell
-history, and process supervisors):
+Read the value from stdin. Never place a literal secret in command-line
+arguments, shell history, or normal output.
 
 ```bash
 # From a file the agent already holds:
-cat /path/to/secret | .venv/bin/python decrypt_to_file.py release \
+cat /path/to/value | .venv/bin/python decrypt_to_file.py release \
   --relay https://shh.qcfailed.com
 
-# Or from an environment variable (no literal in argv):
-printf '%s' "$SECRET_VAR" | .venv/bin/python decrypt_to_file.py release \
+# Or from an environment variable:
+printf '%s' "$EXPECTED_VARIABLE" | .venv/bin/python decrypt_to_file.py release \
   --relay https://shh.qcfailed.com
 ```
 
-The helper encrypts the value with a fresh symmetric key, submits only
-ciphertext to the relay, and prints a single-use reveal link:
+The helper prints a one-time reveal link:
 
 ```text
 shh reveal link: https://shh.qcfailed.com/reveal#<drop_id>.<key>
 ```
 
-Open the reveal link in a browser, click **Reveal secret**, and the value is
-decrypted locally and shown once, then auto-clipped after a few seconds. The
-fragment carries both the drop id and the key, so the link is the capability:
-treat it as live until it is claimed. After a single claim the relay deletes
-the ciphertext, so a recovered key later cannot decrypt anything.
+Send that complete link privately to the human. The browser claims and decrypts
+it once. After successful decryption, shh removes the key-bearing fragment before
+showing the value, offers explicit **Copy secret** and **Hide now** controls, and
+clears the display on hide, background/page exit, or after a bounded 120-second
+screen/privacy fallback. Copying moves plaintext into the system clipboard,
+which is outside shh's control. These are convenience and privacy-hygiene
+measures, not a security boundary.
 
-## Deployment
+## Deployment and self-hosting
 
-The included Dockerfile declares `/app/data` as its data path, writes telemetry
-there by default, and binds the service for a reverse proxy:
+The included Dockerfile declares `/app/data` as its data path and binds the
+service for a reverse proxy:
 
 ```bash
 docker build -t shh .
 docker run --rm -p 8899:8899 -v shh-data:/app/data shh
 ```
 
-For Coolify, add a **Persistent Storage** volume with a descriptive name (for
-example `shh-data`) and destination path `/app/data`. Coolify namespaces the
-volume for the resource and keeps it across deployments. Dockerfile `VOLUME`
-metadata establishes the portable default path, but it does not create or
-manage Coolify's resource-level persistent-volume setting.
-
-The image defaults to not trusting forwarded headers. If Coolify is the
-immediate proxy, explicitly enable proxy trust and set the CIDR of the proxy
-network, for example:
+For Coolify, add a persistent storage volume at `/app/data`. The image defaults
+to not trusting forwarded headers. If a trusted reverse proxy is the immediate
+peer, explicitly enable proxy trust and set its CIDR:
 
 ```text
 --trust-proxy --trusted-proxy-cidr 172.16.0.0/12
 ```
 
-Use the actual private network for your deployment. The proxy must strip and
-set `X-Forwarded-For`; do not enable this flag when clients can connect
-directly or when the proxy merely appends untrusted values.
-
-Never expose `usage.jsonl` as a static file or mount it into a public directory.
-The file contains pseudonymous client identifiers and operational events.
+Use the actual private network for the deployment. Never expose `usage.jsonl` as
+a static file or mount it into a public directory.
 
 ## Usage telemetry
 
-The server records a local JSONL event with:
+The server records a local JSONL event with a UTC timestamp, event/status, and a
+short-lived keyed-HMAC pseudonym of the client IP. It does not record raw IPs,
+secrets, links/fragments, drop IDs, variable names, target paths, request bodies,
+ciphertext, or plaintext. Logs are mode `0600` and retained for 14 days. Page
+views and routine pending claim polls are not persisted.
 
-- UTC timestamp;
-- event and status;
-- a short-lived keyed-HMAC pseudonym of the client IP.
+This is minimal abuse/usage observation, not access control. A public instance
+will receive scanners and unrelated traffic.
 
-It does not record raw IPs, secrets, links/fragments, drop IDs, variable names,
-target paths, request bodies, ciphertext, or plaintext. Logs are mode `0600`
-and retained for 14 days. Normal records are append-only; bounded retention
-maintenance runs at startup and through the existing periodic sweeper. The page
-discloses this telemetry. Page views and routine pending claim polls are not
-persisted.
+## API and public documents
 
-This is minimal abuse/usage observation, not access control. If you expose the
-service publicly, expect unrelated traffic and rate-limit responses.
-
-## API
-
-All API responses use `Cache-Control: no-store`.
-State-changing endpoints require `Content-Type: application/json` (normal
-parameters such as `charset=utf-8` are accepted). Other media types receive
-`415 unsupported_media_type` before rate-limit or drop-state mutation. The
-service does not emit permissive CORS headers.
+All API responses use `Cache-Control: no-store`. State-changing endpoints require
+`Content-Type: application/json`, and the service does not emit permissive CORS
+headers.
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/drops` | Receiver creates one pending drop. |
-| `POST` | `/api/drops/{id}/payload` | Browser submits one versioned base64url sealed-box payload. |
-| `POST` | `/api/drops/{id}/claim` | Receiver polls and atomically claims ciphertext once. |
-| `GET` | `/api/drops/{id}` | Returns non-secret pending/submitted/claimed status. |
+| `POST` | `/api/drops/{id}/payload` | Browser submits one versioned sealed-box payload. |
+| `POST` | `/api/drops/{id}/claim` | Receiver polls and claims ciphertext once. |
+| `GET` | `/api/drops/{id}` | Returns non-secret drop status. |
+| `GET` | `/` | Public onboarding or browser sender page. |
+| `GET` | `/reveal` | One-time browser reveal page. |
+| `GET` | `/agent.md` | Canonical machine-readable agent guide. |
+| `GET` | `/llms.txt` | Short agent-discovery document. |
 | `GET` | `/healthz` | Liveness check. |
-| `GET` | `/` | Browser sender page. |
 
 The old `/secret` and `/out/{id}` AES-link endpoints return `410` and are not
-compatible with shh v1.
+compatible with shh v1. Use the supported helper; do not guess or reimplement
+the crypto protocol from raw API calls.
 
 ## Tests
 
-Install development dependencies:
+Install development dependencies and Chromium:
 
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m playwright install chromium
 ```
 
-Run unit tests plus the real browser-to-receiver delivery test:
+Run the full suite:
 
 ```bash
 .venv/bin/pytest
 ```
 
-The browser test proves that the actual vendored browser modules encrypt a
-secret, the relay receives only ciphertext, the receiver decrypts it locally,
-and the expected `.env` file is written. It also asserts that the test secret
-is absent from captured helper stdout and stderr.
-
-On stripped ARM64 containers, Chromium may need local shared libraries. The
-application itself does not need those test-only libraries; install them using
-your image's normal package mechanism or set `LD_LIBRARY_PATH` for the test
-process only.
+The browser tests prove the actual vendored browser modules encrypt or decrypt
+through the relay, preserve one-time semantics, avoid plaintext in helper output
+and telemetry, render the public onboarding experience, and exercise the reveal
+cleanup controls. Docker CI also verifies the browser flows against the shipped
+container rather than an accidental local server.
 
 ## Files
 
-- `server.py` — RAM-only relay, browser page, API, rate limits, and telemetry.
-- `decrypt_to_file.py` — receiver keypair, polling, sealed-box decryption, and
-  atomic `.env` writer.
-- `static/app.js` — browser-side sealed-box encryption.
+- `server.py` — RAM-only relay, pages, public documents, API, rate limits, and telemetry.
+- `decrypt_to_file.py` — receiver keypair, polling, release helper, local decryption, and atomic `.env` writer.
+- `static/app.js` — browser-side sealed-box encryption and onboarding mode selection.
+- `static/app_reveal.js` — one-time reveal, copy/hide controls, and cleanup hygiene.
+- `static/app.css` — shared responsive visual system and CSP-compatible styles.
+- `docs/agent.md` — canonical agent onboarding instructions.
+- `docs/architecture-security.md` — architecture, crypto vocabulary, threat model, and privacy boundary.
 - `vendor/` — pinned browser libsodium modules and license texts.
-- `docs/architecture-security.md` — architecture, crypto vocabulary, threat
-  model, privacy policy, lifecycle, and rollback notes.
-- `docs/THIRD_PARTY_NOTICES.md` — dependency/license provenance.
 
 ## License
 

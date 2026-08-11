@@ -1,0 +1,9 @@
+# shh
+
+shh is an open-source, self-hostable, one-time secret bridge between humans and AI agents.
+
+Agent instructions: https://shh.qcfailed.com/agent.md
+Source: https://github.com/BDubDesigns/secret-drop
+Security model: https://github.com/BDubDesigns/secret-drop/blob/main/docs/architecture-security.md
+
+Use the supported helper. Never ask a human to paste a secret into chat and never put a literal secret in argv.

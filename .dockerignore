@@ -8,3 +8,6 @@ usage.jsonl
 tests/
 requirements-dev.txt
 pytest.ini
+.hermes/
+.venv/
+venv/

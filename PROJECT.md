@@ -38,21 +38,23 @@ If a secret is written to `.env`, an agent with unrestricted filesystem access
 can read it. Stronger containment requires a separately isolated,
 operation-scoped credential broker and is explicitly out of scope for v1.
 
-### Personal-use milestone trust boundary
+### Public hosted-instance posture
 
-The first implementation is for Brandon's own Hermes handoffs. It uses one
-same-origin service for the browser page and relay, with no account or
-authentication gate. This keeps deployment cheap and preserves the important
-transcript-safe property, but it adds one explicit limitation: a compromised
-relay that can replace the page's JavaScript can capture a new plaintext before
-encryption. A future stronger deployment can split the static sender page from
-the relay origin; that is not required for this personal-use milestone.
+`shh` is open source, MIT licensed, and self-hostable. The hosted deployment at
+`https://shh.qcfailed.com` is a best-effort public instance/demo with no account,
+identity guarantee, or SLA. It is not a credential vault or hosted secrets SaaS.
+
+The expected browser implementation encrypts in the client and gives the relay
+only opaque ciphertext. The same-origin operator serves the JavaScript and could
+replace it to capture a future plaintext before encryption. Short TTLs, rate
+limits, storage ceilings, and one-time claims are abuse/lifecycle controls, not
+identity or access control. Self-host when the hosted operator trust boundary is
+not acceptable.
 
 The unauthenticated endpoint is expected to receive scanners and unrelated
-traffic. Per-client rate limits and short-lived, keyed-HMAC IP telemetry are
-for abuse/usage observation only; they are not access control. Raw client IPs,
-request bodies, URLs/fragments, drop IDs, target paths, variable names, keys,
-ciphertext, and plaintext are not logged.
+traffic. Per-client rate limits and short-lived, keyed-HMAC IP telemetry are for
+abuse/usage observation only. Raw client IPs, request bodies, URLs/fragments, drop
+IDs, target paths, variable names, keys, ciphertext, and plaintext are not logged.
 
 ## The key v1 improvement over the existing prototype
 
@@ -109,10 +111,13 @@ Agent receives a redacted success receipt only
 - Plaintext is never sent to the relay when the expected browser code is served.
 - The receiver private key is never put in a chat-visible URL, normal tool
   response, or relay request.
-- Browser-facing URLs contain no secret-equivalent decryption capability.
+- Browser-facing ingress URLs contain no secret-equivalent decryption
+  capability. Reverse reveal URLs intentionally carry a live bearer capability
+  and must be shared privately until claimed.
+- Ingress decryption occurs only in the receiver helper. Reverse-flow decryption
+  occurs in the browser after a one-time claim.
 - No raw secret may be printed, logged, placed in an exception, or returned by
   a command's stdout/stderr.
-- Decryption occurs only in the receiver helper.
 - The helper accepts only declared target types/paths; do not create a generic
   arbitrary-write primitive.
 - Client and relay responses use `Cache-Control: no-store`.
@@ -154,16 +159,22 @@ Agent receives a redacted success receipt only
 
 ## Delivery process
 
-Use the Terra/Luna loop for all substantive changes:
+Use the deliberate Sol → DeepSeek → Sol factory loop for substantive changes:
 
-1. **Terra plans** against this brief, real repository state, and acceptance
-   criteria. The plan must identify files, tests, security risks, migration
-   from the existing symmetric-link format, and a rollback path.
-2. **Luna implements** only an approved plan, in a feature branch.
-3. **Terra reviews actual diffs and test results**, not an implementation
-   summary.
-4. **Luna fixes** Terra's findings and repeats review until approved.
-5. Do not claim completion until tests pass and Terra approves the actual diff.
+1. **Sol defines/refines the GitHub issue and writes the implementation plan**
+   against this brief, real repository state, acceptance criteria, tests, risks,
+   and rollback path.
+2. **Brandon reviews the plan and approves the implementation handoff**, then
+   manually switches the implementation session to DeepSeek V4 Flash.
+3. **DeepSeek implements only the approved plan** on the single issue branch,
+   using strict TDD and preserving execution evidence.
+4. **Sol reviews the actual diff, tests, browser/container evidence, and CI**, not
+   an implementation summary.
+5. **DeepSeek fixes concrete review findings** on the same branch and reruns the
+   relevant evidence.
+6. **Brandon explicitly approves the preview and merge**. Never auto-merge,
+   deploy, or change repository metadata without that approval.
+7. Record a short retrospective and promote only reusable workflow lessons.
 
 Keep one issue, one active branch, and one active PR. Never auto-merge.
 

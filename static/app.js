@@ -1,8 +1,17 @@
 import sodium from "/static/libsodium-wrappers.mjs";
 
+const landing = document.querySelector("#landing");
+const delivery = document.querySelector("#delivery");
+const handoffMessage = document.querySelector("#handoff-message");
 const input = document.querySelector("#input");
 const button = document.querySelector("#send");
 const status = document.querySelector("#status");
+const copyAgentButton = document.querySelector("#copy-agent-url");
+const agentUrl = document.querySelector("#agent-url");
+const agentCopyStatus = document.querySelector("#agent-copy-status");
+const RECEIVER_PUBLIC_KEY_BYTES = 32;
+
+agentUrl.textContent = new URL("/agent.md", window.location.origin).href;
 
 function show(message, error = false) {
   status.hidden = false;
@@ -13,24 +22,59 @@ function show(message, error = false) {
 
 function receiverLink() {
   const fragment = window.location.hash.slice(1);
+  if (!fragment) return { state: "missing" };
   const separator = fragment.indexOf(".");
-  if (separator <= 0) return null;
+  if (separator <= 0) return { state: "invalid" };
   const id = fragment.slice(0, separator);
   const publicKey = fragment.slice(separator + 1);
-  if (!/^[A-Za-z0-9_-]{20,64}$/.test(id) || !/^[A-Za-z0-9_-]+$/.test(publicKey)) {
-    return null;
+  if (!/^[A-Za-z0-9_-]{20,64}$/.test(id)
+      || !/^[A-Za-z0-9_-]+$/.test(publicKey)
+      || publicKey.length > 64) {
+    return { state: "invalid" };
   }
-  return { id, publicKey };
+  const paddedKey = publicKey.replace(/-/g, "+").replace(/_/g, "/")
+    + "=".repeat((4 - (publicKey.length % 4)) % 4);
+  let decodedKey;
+  try {
+    decodedKey = atob(paddedKey);
+  } catch {
+    return { state: "invalid" };
+  }
+  if (decodedKey.length !== RECEIVER_PUBLIC_KEY_BYTES) {
+    return { state: "invalid" };
+  }
+  return { state: "valid", id, publicKey };
 }
 
 const link = receiverLink();
-if (!link) {
+if (link.state === "valid") {
+  landing.hidden = true;
+  delivery.hidden = false;
+  button.disabled = false;
+} else {
+  landing.hidden = false;
+  delivery.hidden = true;
   button.disabled = true;
-  show("Open the complete receiver link provided by the agent.", true);
+  if (link.state === "invalid") {
+    handoffMessage.textContent = "Incomplete or invalid handoff link. Ask your agent for a fresh link.";
+    handoffMessage.dataset.error = "true";
+  }
 }
 
+copyAgentButton.addEventListener("click", async () => {
+  const value = agentUrl.textContent;
+  try {
+    await navigator.clipboard.writeText(value);
+    agentCopyStatus.hidden = false;
+    agentCopyStatus.textContent = "Copied. This is a public guide URL, not a secret.";
+  } catch {
+    agentCopyStatus.hidden = false;
+    agentCopyStatus.textContent = "Copy was blocked by the browser. Select the guide URL manually.";
+  }
+});
+
 button.addEventListener("click", async () => {
-  if (!link) return;
+  if (link.state !== "valid") return;
   const secret = input.value;
   if (!secret) {
     show("Paste a secret first.", true);
