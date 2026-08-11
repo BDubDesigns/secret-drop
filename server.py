@@ -401,23 +401,45 @@ def _build_reveal_page(ttl: float) -> tuple[str, str]:
     nonce = secrets.token_urlsafe(18)
     ttl_min = max(1, int(round(ttl / 60)))
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>shh — reveal secret</title>
 <meta name="description" content="Reveal a one-time secret delivered by the agent.">
 <link rel="stylesheet" href="/static/app.css">
-</head><body>
-<h1>🔓 shh reveal</h1>
-<p>A secret was delivered through the relay for you. This link works once and expires after {ttl_min} minute(s).</p>
-<button id="reveal" type="button">Reveal secret</button>
-<div id="status" role="status"></div>
-<h2 id="secret-heading" hidden>Secret (will be clipped shortly)</h2>
-<textarea id="secret" autocomplete="off" spellcheck="false" readonly hidden></textarea>
-<p class="note">The relay stores only ciphertext and deletes it after a single claim. For abuse monitoring, this service records a short-lived pseudonymous client identifier, timestamp, event, and status. It does not record secret contents, links, or drop IDs.</p>
-<div class="alert"><b>Trust boundary:</b> keep this link private until you reveal it. Anyone who opens it before you can claim the secret, and once claimed it is gone.</div>
+</head>
+<body>
+<div class="page-shell task-shell">
+<header class="site-header">
+  <a class="brand" href="/" aria-label="shh home"><span class="brand-mark">shh</span></a>
+  <span class="eyebrow">one-time reveal</span>
+</header>
+<main class="panel">
+  <p class="eyebrow">Agent → Human</p>
+  <h1>Reveal secret</h1>
+  <p>A secret was delivered through the relay for you. This link works once and expires after {ttl_min} minute(s).</p>
+  <button id="reveal" type="button">Reveal secret</button>
+  <div id="status" role="status" aria-live="polite"></div>
+  <h2 id="secret-heading" hidden>Revealed secret</h2>
+  <textarea id="secret" aria-label="Revealed secret" aria-describedby="secret-note" autocomplete="off" spellcheck="false" readonly hidden></textarea>
+  <div id="secret-actions" class="button-row" hidden>
+    <button id="copy-secret" type="button">Copy secret</button>
+    <button id="hide-secret" class="button-secondary" type="button">Hide now</button>
+  </div>
+  <p id="secret-note" class="note">The relay stores only ciphertext and deletes it after a single claim. The revealed value is hidden when you leave the page and after a bounded 120-second screen/privacy fallback. Copying moves plaintext into the system clipboard, which is outside shh's control.</p>
+  <div class="alert"><b>Trust boundary:</b> keep this link private until you reveal it. Anyone who opens it before you can claim the secret, and once claimed it is gone.</div>
+</main>
+<footer class="site-footer">
+  <a href="https://github.com/BDubDesigns/secret-drop">GitHub</a>
+  <a href="https://github.com/BDubDesigns/secret-drop/blob/main/docs/architecture-security.md">Architecture &amp; security</a>
+  <a href="https://qcfailed.com">Built by Brandon Werner</a>
+</footer>
+</div>
 <script type="importmap" nonce="{nonce}">{{"imports":{{"libsodium":"/static/libsodium.mjs"}}}}</script>
 <script type="module" nonce="{nonce}" src="/static/app_reveal.js"></script>
-</body></html>""", nonce
+</body>
+</html>""", nonce
 
 
 class DropHandler(BaseHTTPRequestHandler):

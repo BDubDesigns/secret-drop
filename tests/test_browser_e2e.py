@@ -363,13 +363,16 @@ def test_browser_reveals_agent_released_secret_once(tmp_path):
             page.locator("#secret").wait_for(state="visible", timeout=10000)
             revealed = page.locator("#secret").input_value()
             assert revealed == secret
+            assert "#" not in page.url
+            expect(page.locator("#copy-secret")).to_be_visible()
+            expect(page.locator("#hide-secret")).to_be_visible()
             assert page.locator("#secret-heading").is_visible()
             # The secret must actually clip itself, and the key-carrying
             # fragment must be removed from the URL afterwards.
             page.locator("#secret").wait_for(state="hidden", timeout=10000)
             assert page.locator("#secret").input_value() == ""
             assert "#" not in page.url
-            assert "clipped" in page.locator("#status").text_content().lower()
+            assert "hidden" in page.locator("#status").text_content().lower()
             browser.close()
 
         # Second reveal attempt in a fresh page must fail (single use).
@@ -425,6 +428,98 @@ def test_browser_truncated_key_does_not_destroy_drop(tmp_path):
             assert response.status == 200, response.status
             body = json.loads(response.read())
         assert body.get("v") == 1 and isinstance(body.get("payload"), str)
+
+
+def test_browser_reveal_supports_explicit_hide(tmp_path):
+    secret = "explicit-hide-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.locator("#hide-secret").click()
+            assert page.locator("#secret").is_hidden()
+            assert page.locator("#secret").input_value() == ""
+            assert page.locator("#secret-actions").is_hidden()
+            expect(page.locator("#status")).to_contain_text("hidden")
+            assert secret not in (page.locator("#status").text_content() or "")
+            browser.close()
+
+
+def test_browser_reveal_supports_user_initiated_copy(tmp_path):
+    secret = "explicit-copy-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            context = browser.new_context()
+            context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base)
+            page = context.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.locator("#copy-secret").click()
+            expect(page.locator("#status")).to_contain_text("outside shh's control")
+            clipboard = page.evaluate("navigator.clipboard.readText()")
+            if clipboard != secret:
+                raise AssertionError("clipboard did not receive the revealed value")
+            browser.close()
+
+
+def test_browser_reveal_clears_on_pagehide(tmp_path):
+    secret = "pagehide-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(link, wait_until="networkidle")
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+            assert page.locator("#secret").is_hidden()
+            assert page.locator("#secret").input_value() == ""
+            assert page.locator("#secret-actions").is_hidden()
+            expect(page.locator("#status")).to_contain_text("hidden")
+            browser.close()
+
+
+def test_browser_reveal_clamps_timer_override_to_production_fallback(tmp_path):
+    secret = "timer-clamp-secret-must-not-appear-in-output"
+
+    with browser_test_relay(tmp_path) as (base, _):
+        link = release_link(base, secret)
+        path, _, fragment = link.partition("#")
+        long_link = f"{path}?clip=999999#{fragment}"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.goto(long_link, wait_until="networkidle")
+            assert "?clip=999999#" in page.url
+            page.locator("#reveal").click()
+            page.locator("#secret").wait_for(state="visible", timeout=10000)
+            expect(page.locator("#status")).to_contain_text("120 seconds")
+            assert "?clip=999999" in page.url
+            assert "#" not in page.url
+            browser.close()
 
 
 def test_browser_reveal_keeps_xss_shaped_secret_inert(tmp_path):
