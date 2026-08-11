@@ -47,6 +47,16 @@ STATIC_ROOT = Path(__file__).with_name("static")
 VENDOR_ROOT = Path(__file__).with_name("vendor")
 AGENT_GUIDE_PATH = Path(__file__).with_name("docs") / "agent.md"
 LLMS_PATH = Path(__file__).with_name("llms.txt")
+STATIC_FILES = {
+    "app.js": (STATIC_ROOT / "app.js", "application/javascript; charset=utf-8"),
+    "app_reveal.js": (STATIC_ROOT / "app_reveal.js", "application/javascript; charset=utf-8"),
+    "app.css": (STATIC_ROOT / "app.css", "text/css; charset=utf-8"),
+    "libsodium.mjs": (VENDOR_ROOT / "libsodium.mjs", "application/javascript; charset=utf-8"),
+    "libsodium-wrappers.mjs": (
+        VENDOR_ROOT / "libsodium-wrappers.mjs",
+        "application/javascript; charset=utf-8",
+    ),
+}
 
 
 @dataclass
@@ -277,6 +287,15 @@ def _json_bytes(value: dict[str, Any]) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 
 
+def _page_csp(nonce: str) -> str:
+    return (
+        "default-src 'none'; script-src 'self' 'nonce-"
+        + nonce
+        + "' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'none'"
+    )
+
+
 def _build_page(ttl_seconds: float) -> tuple[str, str]:
     ttl_min = max(1, int(ttl_seconds // 60))
     nonce = secrets.token_urlsafe(18)
@@ -285,14 +304,8 @@ def _build_page(ttl_seconds: float) -> tuple[str, str]:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>shh — private secret handoff</title>
 <meta name="description" content="Deliver one secret to a declared agent-side environment file without putting plaintext in chat.">
-<style>
-body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:640px;margin:40px auto;padding:0 20px;line-height:1.6}}
-h1{{font-size:1.6rem}} h2{{font-size:1.1rem;margin-top:28px}}
-textarea{{width:100%;height:150px;background:#1a1d24;color:#e6e6e6;border:1px solid #333;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;box-sizing:border-box}}
-button{{margin-top:12px;padding:10px 18px;border:0;border-radius:8px;background:#4f8cff;color:#fff;font-size:1rem;cursor:pointer}}
-button:disabled{{opacity:.5}} #status{{margin-top:16px;white-space:pre-wrap;background:#1a1d24;padding:12px;border-radius:8px;display:none}}
-.note{{font-size:.86rem;color:#aeb4c0;margin-top:24px}} .alert{{background:#2a1f1f;border:1px solid #5a3a3a;padding:10px 14px;border-radius:8px;margin-top:20px;font-size:.9rem}}
-</style></head><body>
+<link rel="stylesheet" href="/static/app.css">
+</head><body>
 <h1>🔐 shh</h1>
 <p>Paste one secret for the receiver who sent you this link. Your browser encrypts it with the receiver's one-time public key before upload. The relay stores only ciphertext and the drop expires after {ttl_min} minutes.</p>
 <h2>Secret</h2>
@@ -314,14 +327,8 @@ def _build_reveal_page(ttl: float) -> tuple[str, str]:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>shh — reveal secret</title>
 <meta name="description" content="Reveal a one-time secret delivered by the agent.">
-<style>
-body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;max-width:640px;margin:40px auto;padding:0 20px;line-height:1.6}}
-h1{{font-size:1.6rem}} h2{{font-size:1.1rem;margin-top:28px}}
-textarea{{width:100%;height:150px;background:#1a1d24;color:#e6e6e6;border:1px solid #333;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;box-sizing:border-box}}
-button{{margin-top:12px;padding:10px 18px;border:0;border-radius:8px;background:#4f8cff;color:#fff;font-size:1rem;cursor:pointer}}
-button:disabled{{opacity:.5}} #status{{margin-top:16px;white-space:pre-wrap;background:#1a1d24;padding:12px;border-radius:8px;display:none}}
-.note{{font-size:.86rem;color:#aeb4c0;margin-top:24px}} .alert{{background:#1f2a2a;border:1px solid #3a5a5a;padding:10px 14px;border-radius:8px;margin-top:20px;font-size:.9rem}}
-</style></head><body>
+<link rel="stylesheet" href="/static/app.css">
+</head><body>
 <h1>🔓 shh reveal</h1>
 <p>A secret was delivered through the relay for you. This link works once and expires after {ttl_min} minute(s).</p>
 <button id="reveal" type="button">Reveal secret</button>
@@ -427,33 +434,21 @@ class DropHandler(BaseHTTPRequestHandler):
         if path in {"/", "/index.html"}:
             page, nonce = _build_page(self.secret_ttl)
             body = page.encode("utf-8")
-            csp = (
-                "default-src 'none'; script-src 'self' 'nonce-"
-                + nonce
-                + "' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; "
-                "base-uri 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'none'"
-            )
             self._send(
                 200,
                 body,
                 "text/html; charset=utf-8",
-                {"Content-Security-Policy": csp},
+                {"Content-Security-Policy": _page_csp(nonce)},
             )
             return
         if path == "/reveal":
             page, nonce = _build_reveal_page(self.secret_ttl)
             body = page.encode("utf-8")
-            csp = (
-                "default-src 'none'; script-src 'self' 'nonce-"
-                + nonce
-                + "' 'wasm-unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; "
-                "base-uri 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'none'"
-            )
             self._send(
                 200,
                 body,
                 "text/html; charset=utf-8",
-                {"Content-Security-Policy": csp},
+                {"Content-Security-Policy": _page_csp(nonce)},
             )
             return
         if path == "/robots.txt":
@@ -480,12 +475,14 @@ class DropHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/static/"):
             filename = path.removeprefix("/static/")
-            allowed = {"app.js": STATIC_ROOT / "app.js", "app_reveal.js": STATIC_ROOT / "app_reveal.js", "libsodium.mjs": VENDOR_ROOT / "libsodium.mjs", "libsodium-wrappers.mjs": VENDOR_ROOT / "libsodium-wrappers.mjs"}
-            file_path = allowed.get(filename)
-            if file_path is None or not file_path.is_file():
+            file_entry = STATIC_FILES.get(filename)
+            if file_entry is None:
                 self._json({"error": "not_found"}, 404)
                 return
-            content_type = "application/javascript; charset=utf-8"
+            file_path, content_type = file_entry
+            if not file_path.is_file():
+                self._json({"error": "not_found"}, 404)
+                return
             self._send(200, file_path.read_bytes(), content_type)
             return
         if path.startswith("/out/") or path == "/secret":

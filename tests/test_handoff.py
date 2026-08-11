@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -466,6 +467,32 @@ def test_env_writer_rejects_unsafe_target_and_duplicate_variable(tmp_path):
     target.write_text("TOKEN=one\nTOKEN=two\n")
     with pytest.raises(ValueError, match="duplicate"):
         write_env_value(target, "TOKEN", "x")
+
+
+def test_pages_share_external_css_and_strict_csp(app_server):
+    base, _ = app_server
+
+    with urlopen(base + "/", timeout=3) as response:
+        root_page = response.read().decode()
+        root_csp = response.headers["Content-Security-Policy"]
+    with urlopen(base + "/reveal", timeout=3) as response:
+        reveal_page = response.read().decode()
+        reveal_csp = response.headers["Content-Security-Policy"]
+    with urlopen(base + "/static/app.css", timeout=3) as response:
+        css = response.read().decode()
+        css_type = response.headers.get_content_type()
+
+    assert "/static/app.css" in root_page
+    assert "/static/app.css" in reveal_page
+    assert "<style>" not in root_page
+    assert "<style>" not in reveal_page
+    assert "style-src 'self'" in root_csp
+    assert "'unsafe-inline'" not in root_csp
+    assert re.sub(r"'nonce-[^']+'", "'nonce'", root_csp) == re.sub(
+        r"'nonce-[^']+'", "'nonce'", reveal_csp
+    )
+    assert css_type == "text/css"
+    assert "--accent:" in css
 
 
 def test_agent_onboarding_documents_are_served(app_server):
