@@ -148,6 +148,7 @@ def test_bare_root_onboards_human_and_agent(tmp_path):
             expect(page.get_by_text("Human → Agent", exact=True)).to_be_visible()
             expect(page.get_by_text("Agent → Human", exact=True)).to_be_visible()
             expect(page.locator('a[href="/agent.md"]')).to_be_visible()
+            expect(page.locator("#agent-url")).to_have_text(f"{base}/agent.md")
             assert page.locator('a[href="https://github.com/BDubDesigns/secret-drop"]').count() >= 1
             assert page.locator('a[href="https://qcfailed.com"]').count() >= 1
             assert not console_errors
@@ -169,6 +170,28 @@ def test_malformed_fragment_stays_in_landing_mode(tmp_path):
             expect(page.locator("#delivery")).to_be_hidden()
             expect(page.get_by_text("incomplete or invalid", exact=False)).to_be_visible()
             expect(page.get_by_text("fresh link", exact=False)).to_be_visible()
+            assert page.locator("#send").is_disabled()
+            assert not any(url.endswith("/payload") for url in requests)
+            browser.close()
+
+
+def test_truncated_public_key_stays_in_landing_mode(tmp_path):
+    drop_id = "A" * 20
+    truncated_key = "A" * 42  # URL-safe base64 that decodes to 31 bytes.
+
+    with browser_test_relay(tmp_path) as (base, _):
+        requests: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on("request", lambda request: requests.append(request.url))
+            page.goto(f"{base}/#{drop_id}.{truncated_key}", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("incomplete or invalid", exact=False)).to_be_visible()
             assert page.locator("#send").is_disabled()
             assert not any(url.endswith("/payload") for url in requests)
             browser.close()

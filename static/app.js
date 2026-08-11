@@ -9,6 +9,9 @@ const status = document.querySelector("#status");
 const copyAgentButton = document.querySelector("#copy-agent-url");
 const agentUrl = document.querySelector("#agent-url");
 const agentCopyStatus = document.querySelector("#agent-copy-status");
+const RECEIVER_PUBLIC_KEY_BYTES = 32;
+
+agentUrl.textContent = new URL("/agent.md", window.location.origin).href;
 
 function show(message, error = false) {
   status.hidden = false;
@@ -24,7 +27,20 @@ function receiverLink() {
   if (separator <= 0) return { state: "invalid" };
   const id = fragment.slice(0, separator);
   const publicKey = fragment.slice(separator + 1);
-  if (!/^[A-Za-z0-9_-]{20,64}$/.test(id) || !/^[A-Za-z0-9_-]+$/.test(publicKey)) {
+  if (!/^[A-Za-z0-9_-]{20,64}$/.test(id)
+      || !/^[A-Za-z0-9_-]+$/.test(publicKey)
+      || publicKey.length > 64) {
+    return { state: "invalid" };
+  }
+  const paddedKey = publicKey.replace(/-/g, "+").replace(/_/g, "/")
+    + "=".repeat((4 - (publicKey.length % 4)) % 4);
+  let decodedKey;
+  try {
+    decodedKey = atob(paddedKey);
+  } catch {
+    return { state: "invalid" };
+  }
+  if (decodedKey.length !== RECEIVER_PUBLIC_KEY_BYTES) {
     return { state: "invalid" };
   }
   return { state: "valid", id, publicKey };

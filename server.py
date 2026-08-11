@@ -359,7 +359,7 @@ def _build_page(ttl_seconds: float) -> tuple[str, str]:
         <h2 id="agent-guide-title">Using an AI agent?</h2>
         <p>Give it the supported guide. It explains the exact helper commands and the trust model without asking anyone to paste a secret into chat.</p>
       </div>
-      <code id="agent-url" class="url">https://shh.qcfailed.com/agent.md</code>
+      <code id="agent-url" class="url">/agent.md</code>
       <div class="button-row">
         <a href="/agent.md">Read the agent guide</a>
         <button id="copy-agent-url" class="button-secondary" type="button">Copy agent URL</button>
