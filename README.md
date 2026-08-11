@@ -64,6 +64,36 @@ Values accepted by `shh` load exactly under normal python-dotenv/Hermes semantic
 ordinary `$`, backticks, backslashes, and quotes round-trip. NULs, multiline
 values, and `${...}` interpolation syntax are rejected rather than transformed.
 
+### Reverse handoff: agent → human (`release`)
+
+To hand a secret **back out** to a human without putting plaintext in chat,
+publish it for a one-time browser reveal. Read the value from stdin — never
+embed the literal in the command line (argv leaks via `/proc/*/cmdline`, shell
+history, and process supervisors):
+
+```bash
+# From a file the agent already holds:
+cat /path/to/secret | .venv/bin/python decrypt_to_file.py release \
+  --relay https://shh.qcfailed.com
+
+# Or from an environment variable (no literal in argv):
+printf '%s' "$SECRET_VAR" | .venv/bin/python decrypt_to_file.py release \
+  --relay https://shh.qcfailed.com
+```
+
+The helper encrypts the value with a fresh symmetric key, submits only
+ciphertext to the relay, and prints a single-use reveal link:
+
+```text
+shh reveal link: https://shh.qcfailed.com/reveal#<drop_id>.<key>
+```
+
+Open the reveal link in a browser, click **Reveal secret**, and the value is
+decrypted locally and shown once, then auto-clipped after a few seconds. The
+fragment carries both the drop id and the key, so the link is the capability:
+treat it as live until it is claimed. After a single claim the relay deletes
+the ciphertext, so a recovered key later cannot decrypt anything.
+
 ## Deployment
 
 The included Dockerfile declares `/app/data` as its data path, writes telemetry
