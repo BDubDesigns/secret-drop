@@ -45,6 +45,8 @@ DROP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 STATIC_ROOT = Path(__file__).with_name("static")
 VENDOR_ROOT = Path(__file__).with_name("vendor")
+AGENT_GUIDE_PATH = Path(__file__).with_name("docs") / "agent.md"
+LLMS_PATH = Path(__file__).with_name("llms.txt")
 
 
 @dataclass
@@ -456,6 +458,22 @@ class DropHandler(BaseHTTPRequestHandler):
             return
         if path == "/robots.txt":
             self._send(200, b"User-agent: *\nAllow: /\n", "text/plain; charset=utf-8")
+            return
+        if path == "/agent.md":
+            if not AGENT_GUIDE_PATH.is_file():
+                self._json({"error": "not_found"}, 404)
+                return
+            self._send(
+                200,
+                AGENT_GUIDE_PATH.read_bytes(),
+                "text/markdown; charset=utf-8",
+            )
+            return
+        if path == "/llms.txt":
+            if not LLMS_PATH.is_file():
+                self._json({"error": "not_found"}, 404)
+                return
+            self._send(200, LLMS_PATH.read_bytes(), "text/plain; charset=utf-8")
             return
         if path == "/healthz":
             self._json({"status": "ok"})

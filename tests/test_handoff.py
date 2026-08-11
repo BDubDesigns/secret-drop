@@ -468,6 +468,40 @@ def test_env_writer_rejects_unsafe_target_and_duplicate_variable(tmp_path):
         write_env_value(target, "TOKEN", "x")
 
 
+def test_agent_onboarding_documents_are_served(app_server):
+    base, _ = app_server
+
+    with urlopen(base + "/agent.md", timeout=3) as response:
+        agent = response.read().decode()
+        agent_type = response.headers.get_content_type()
+        agent_cache = response.headers["Cache-Control"]
+
+    with urlopen(base + "/llms.txt", timeout=3) as response:
+        llms = response.read().decode()
+        llms_type = response.headers.get_content_type()
+
+    assert agent_type == "text/markdown"
+    assert agent_cache == "no-store"
+    assert "decrypt_to_file.py receive" in agent
+    assert "decrypt_to_file.py release" in agent
+    assert "stdin" in agent.lower()
+    assert "never ask" in agent.lower()
+    assert "--secret" not in agent
+    assert "https://github.com/BDubDesigns/secret-drop" in agent
+    assert "/agent.md" in llms
+    assert "docs/architecture-security.md" in llms
+    assert llms_type == "text/plain"
+
+
+def test_onboarding_documents_do_not_serve_near_miss_paths(app_server):
+    base, _ = app_server
+
+    status, body = error_json(base + "/agent.md/extra")
+
+    assert status == 404
+    assert body == {"error": "not_found"}
+
+
 def test_page_uses_sealed_box_and_discloses_pseudonymous_telemetry(app_server):
     base, _ = app_server
     with urlopen(base + "/", timeout=3) as response:
