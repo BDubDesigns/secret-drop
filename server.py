@@ -300,23 +300,101 @@ def _build_page(ttl_seconds: float) -> tuple[str, str]:
     ttl_min = max(1, int(ttl_seconds // 60))
     nonce = secrets.token_urlsafe(18)
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>shh — private secret handoff</title>
-<meta name="description" content="Deliver one secret to a declared agent-side environment file without putting plaintext in chat.">
+<title>shh — one-time secret bridge</title>
+<meta name="description" content="A one-time secret bridge for humans and AI agents.">
 <link rel="stylesheet" href="/static/app.css">
-</head><body>
-<h1>🔐 shh</h1>
-<p>Paste one secret for the receiver who sent you this link. Your browser encrypts it with the receiver's one-time public key before upload. The relay stores only ciphertext and the drop expires after {ttl_min} minutes.</p>
-<h2>Secret</h2>
-<textarea id="input" autocomplete="off" spellcheck="false" placeholder="Paste the secret here..."></textarea><br>
-<button id="send" type="button">Encrypt &amp; deliver</button>
-<div id="status" role="status"></div>
-<p class="note">For abuse monitoring, this service records a short-lived pseudonymous client identifier, timestamp, event, and status. It does not record secret contents, links, target paths, or request bodies. Logs are retained locally for 14 days.</p>
-<div class="alert"><b>Trust boundary:</b> this personal-use service keeps the secret out of chat, model context, normal tool output, and relay storage. It assumes this origin serves the expected browser code; a compromised relay could alter new submissions.</div>
+</head>
+<body>
+<div class="page-shell landing-shell">
+<header class="site-header">
+  <a class="brand" href="/" aria-label="shh home"><span class="brand-mark">shh</span></a>
+  <span class="eyebrow">one-time secret bridge</span>
+</header>
+<main>
+  <section id="landing" aria-labelledby="hero-title">
+    <div class="hero">
+      <p class="eyebrow">Private handoffs, without chat</p>
+      <h1 id="hero-title">A one-time secret bridge for humans and AI agents.</h1>
+      <p class="lede">shh keeps plaintext out of chat and model context while a declared receiver or human claims it once. The hosted instance is a best-effort public demo; shh is open source and self-hostable.</p>
+      <div class="badge-row" aria-label="Product properties">
+        <span class="badge badge-positive">open source</span>
+        <span class="badge">MIT</span>
+        <span class="badge">self-hostable</span>
+        <span class="badge badge-positive">blind relay</span>
+      </div>
+    </div>
+
+    <p id="handoff-message" class="alert" role="status">No handoff link detected. Ask your agent to create one.</p>
+
+    <div class="flow-grid">
+      <section class="flow-card" aria-labelledby="human-agent-title">
+        <p class="eyebrow">Declared receiver</p>
+        <h2 id="human-agent-title">Human → Agent</h2>
+        <p>The agent creates a one-time link with its public key. You encrypt the value in this browser, and the receiver claims it and writes the approved target locally.</p>
+        <ol class="step-list">
+          <li><span class="step-number">1</span><span>Agent creates the handoff and names the destination.</span></li>
+          <li><span class="step-number">2</span><span>Human opens the complete link and encrypts in the browser.</span></li>
+          <li><span class="step-number">3</span><span>Agent decrypts locally and writes one approved value.</span></li>
+        </ol>
+      </section>
+      <section class="flow-card" aria-labelledby="agent-human-title">
+        <p class="eyebrow">One-time reveal</p>
+        <h2 id="agent-human-title">Agent → Human</h2>
+        <p>The agent publishes ciphertext from stdin and sends a reveal link. You claim it once in the browser, with explicit controls for copying or hiding the value.</p>
+        <ol class="step-list">
+          <li><span class="step-number">1</span><span>Agent publishes a value without putting it in chat.</span></li>
+          <li><span class="step-number">2</span><span>Human opens the reveal link and claims it once.</span></li>
+          <li><span class="step-number">3</span><span>The browser clears the capability and display when finished.</span></li>
+        </ol>
+      </section>
+    </div>
+
+    <aside class="agent-callout" aria-labelledby="agent-guide-title">
+      <div>
+        <p class="eyebrow">Machine-readable onboarding</p>
+        <h2 id="agent-guide-title">Using an AI agent?</h2>
+        <p>Give it the supported guide. It explains the exact helper commands and the trust model without asking anyone to paste a secret into chat.</p>
+      </div>
+      <code id="agent-url" class="url">https://shh.qcfailed.com/agent.md</code>
+      <div class="button-row">
+        <a href="/agent.md">Read the agent guide</a>
+        <button id="copy-agent-url" class="button-secondary" type="button">Copy agent URL</button>
+      </div>
+      <p id="agent-copy-status" class="note" role="status" hidden></p>
+    </aside>
+
+    <p class="trust-note"><strong>Trust summary:</strong> the expected browser implementation encrypts before upload and the relay stores opaque ciphertext. The same-origin operator serves this JavaScript and could replace it to capture a future plaintext. Short TTLs and one-time claims are lifecycle controls, not identity or access control.</p>
+  </section>
+
+  <section id="delivery" class="task-shell panel" aria-labelledby="delivery-title" hidden>
+    <p class="eyebrow">Active handoff</p>
+    <h2 id="delivery-title">Deliver your secret</h2>
+    <p>Paste one secret for the receiver who created this link. Your browser encrypts it with the receiver's one-time public key before upload. The relay stores only ciphertext and the drop expires after {ttl_min} minutes.</p>
+    <label for="input">Secret</label>
+    <textarea id="input" autocomplete="off" spellcheck="false" placeholder="Paste the secret here..."></textarea>
+    <div class="button-row">
+      <button id="send" type="button" disabled>Encrypt &amp; deliver</button>
+    </div>
+    <div id="status" role="status" aria-live="polite"></div>
+    <p class="note">For abuse monitoring, this service records a short-lived pseudonymous client identifier, timestamp, event, and status. It does not record secret contents, links, target paths, or request bodies. Logs are retained locally for 14 days.</p>
+    <div class="alert"><b>Trust boundary:</b> this service keeps the secret out of chat, model context, normal tool output, and relay storage. It assumes this origin serves the expected browser code; a compromised relay could alter new submissions.</div>
+  </section>
+</main>
+<footer class="site-footer">
+  <a href="https://github.com/BDubDesigns/secret-drop">GitHub</a>
+  <a href="https://github.com/BDubDesigns/secret-drop/blob/main/docs/architecture-security.md">Architecture &amp; security</a>
+  <a href="https://github.com/BDubDesigns/secret-drop#deployment">Self-hosting</a>
+  <a href="https://qcfailed.com">Built by Brandon Werner</a>
+</footer>
+</div>
 <script type="importmap" nonce="{nonce}">{{"imports":{{"libsodium":"/static/libsodium.mjs"}}}}</script>
 <script type="module" nonce="{nonce}" src="/static/app.js"></script>
-</body></html>""", nonce
+</body>
+</html>""", nonce
 
 
 def _build_reveal_page(ttl: float) -> tuple[str, str]:

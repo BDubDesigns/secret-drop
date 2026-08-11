@@ -125,6 +125,89 @@ def browser_test_relay(tmp_path):
         httpd.server_close()
 
 
+def test_bare_root_onboards_human_and_agent(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        console_errors: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.goto(base + "/", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("No handoff link detected", exact=False)).to_be_visible()
+            expect(page.get_by_text("Human → Agent", exact=True)).to_be_visible()
+            expect(page.get_by_text("Agent → Human", exact=True)).to_be_visible()
+            expect(page.locator('a[href="/agent.md"]')).to_be_visible()
+            assert page.locator('a[href="https://github.com/BDubDesigns/secret-drop"]').count() >= 1
+            assert page.locator('a[href="https://qcfailed.com"]').count() >= 1
+            assert not console_errors
+            browser.close()
+
+
+def test_malformed_fragment_stays_in_landing_mode(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        requests: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page()
+            page.on("request", lambda request: requests.append(request.url))
+            page.goto(base + "/#truncated", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#delivery")).to_be_hidden()
+            expect(page.get_by_text("incomplete or invalid", exact=False)).to_be_visible()
+            expect(page.get_by_text("fresh link", exact=False)).to_be_visible()
+            assert page.locator("#send").is_disabled()
+            assert not any(url.endswith("/payload") for url in requests)
+            browser.close()
+
+
+def test_landing_is_responsive_and_keyboard_reachable(tmp_path):
+    with browser_test_relay(tmp_path) as (base, _):
+        console_errors: list[str] = []
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--use-gl=swiftshader"],
+            )
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                else None,
+            )
+            page.on("pageerror", lambda error: console_errors.append(str(error)))
+            page.goto(base + "/", wait_until="networkidle")
+            expect(page.locator("#landing")).to_be_visible()
+            expect(page.locator("#human-agent-title")).to_be_visible()
+            expect(page.locator("#agent-human-title")).to_be_visible()
+            expect(page.locator('a[href="/agent.md"]')).to_be_visible()
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            reached_agent_link = False
+            for _ in range(20):
+                page.keyboard.press("Tab")
+                if page.locator(":focus").get_attribute("href") == "/agent.md":
+                    reached_agent_link = True
+                    break
+            assert reached_agent_link
+            assert not console_errors
+            browser.close()
+
+
 def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
     with browser_test_relay(tmp_path) as (base, usage_log):
         target = tmp_path / ".env"
@@ -188,6 +271,9 @@ def test_browser_encrypts_and_receiver_writes_without_plaintext_leak(tmp_path):
                         )
                         page.on("pageerror", lambda error: console_errors.append(str(error)))
                         page.goto(link, wait_until="networkidle")
+                        expect(page.locator("#landing")).to_be_hidden()
+                        expect(page.locator("#delivery")).to_be_visible()
+                        expect(page.locator("#send")).to_be_enabled()
                         page.locator("#input").fill(secret)
                         page.locator("#send").click()
                         page.locator("#status").filter(
